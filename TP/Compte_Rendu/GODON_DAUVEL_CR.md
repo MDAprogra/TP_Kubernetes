@@ -35,7 +35,13 @@ docker push docker.io/$env:DOCKERHUB_USER/webapp-frontend:$env:TAG
 
 ## Bloc 1 — Installation du cluster k3s
 
-### Pré-requis machines
+![kubectl get nodes -o wide — 3 nœuds Ready](../../Image/01_scr_all_k3s.png)
 
-![kubectl get nodes -o wide — 3 nœuds Ready](../../Image/scr_all_k3s.png)
+![kubectl get nodes — 3 nœuds Ready](../../Image/02_nodes-ready.png)
+
+![kubectl get pods -A — pods système Running](../../Image/03_pods_systeme.png)
+
+
+## Bloc 2 — Pods, ReplicaSets, Deployments
+
 
