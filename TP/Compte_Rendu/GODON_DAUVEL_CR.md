@@ -549,6 +549,23 @@ L'application backend reste en `Init:0/1` tant que l'initContainer tourne. Une f
 
 ✅ **Défi B validé** : l'initContainer s'exécute correctement et loggue son statut avant de laisser le conteneur principal démarrer.
 
+### Défi C — Multi-conteneurs (Sidecar)
+
+#### Objectif
+Modifier le pod frontend pour ajouter un conteneur *sidecar* (`busybox`) qui lit en temps réel (`tail -f`) les logs de nginx via un volume partagé.
+
+#### Vérification et Logs
+
+Le pod frontend s'affiche désormais avec `2/2` conteneurs prêts (le serveur nginx + le sidecar).
+
+![Pod frontend avec Sidecar (2/2 Ready)](../../Image/Bloc5/03_defi_C.png)
+
+En interrogeant spécifiquement les logs du deuxième conteneur, on obtient bien les logs d'accès nginx :
+
+![Logs du conteneur Sidecar](../../Image/Bloc5/03_defi_C_logs.png)
+
+✅ **Défi C validé** : le conteneur sidecar tourne correctement dans le même pod que le frontend et accède aux logs partagés.
+
 ---
 
 ## Synthèse des commandes clés
