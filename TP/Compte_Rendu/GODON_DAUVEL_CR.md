@@ -164,8 +164,14 @@ godon-k3s-server    Ready    control-plane   6m34s   v1.35.4+k3s1
 ### Objectif
 Comprendre et utiliser les primitives Pod, ReplicaSet, Deployment. Observer l'auto-réparation, le scaling déclaratif et le rolling update.
 
-### Étape 2.1 — Pod simple (`01-pod.yaml`)
+### Étape 2.1 — Pod impératif & déclaratif
 
+**1. Pod impératif :**  
+Test de création rapide d'un pod en ligne de commande :
+
+![Création d'un pod en impératif](../../Image/Bloc2/07_pod_imperatif.png.png)
+
+**2. Pod déclaratif (`01-pod.yaml`) :**  
 Création d'un pod nginx basique pour comprendre la structure d'un manifest YAML et observer le comportement sans Deployment :
 
 ```yaml
@@ -527,6 +533,21 @@ Les deux pods backend sont bien sur des **nœuds différents** ✅
 ![Défi A — Anti-affinité — pods backend sur nœuds distincts](../../Image/Bloc5/01_defi_A.png)
 
 ✅ **Défi A validé** : l'anti-affinité garantit la répartition des pods backend sur des nœuds distincts.
+
+### Défi B — Init container
+
+#### Objectif
+Ajouter un `initContainer` au backend qui simule l'attente d'une base de données (`postgres-svc`) avant de démarrer l'application principale. Cela montre comment bloquer le démarrage d'un pod tant qu'une dépendance n'est pas prête.
+
+#### Vérification et Logs
+
+L'application backend reste en `Init:0/1` tant que l'initContainer tourne. Une fois terminé, le pod passe en `Running`.
+
+![Déploiement avec Init Container](../../Image/Bloc5/02_defi_B.png)
+
+![Logs de l'Init Container](../../Image/Bloc5/02_defi_B_logs.png)
+
+✅ **Défi B validé** : l'initContainer s'exécute correctement et loggue son statut avant de laisser le conteneur principal démarrer.
 
 ---
 
