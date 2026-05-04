@@ -596,3 +596,53 @@ En interrogeant spécifiquement les logs du deuxième conteneur, on obtient bien
 | Service sans endpoints | Selector ne correspond pas aux labels des pods | Vérifier `kubectl describe svc` et les labels |
 | Frontend affiche mais API échoue | Backend non déployé ou `backend-svc` introuvable | Déployer le backend, vérifier le nom du Service |
 | Pod en `Pending` | Ressources insuffisantes ou anti-affinité stricte | `kubectl describe pod` → Events |
+
+
+---
+---
+
+# Compte Rendu — TP2 Kubernetes
+**Binôme : Corentin GODON & Matthias DAUVEL**  
+**Module : Arthur BARADEL — KUBERNETES**  
+**Date : 04 Mai 2026**
+
+---
+
+## Pré-requis — Image backend v2.0
+
+### Contexte
+
+Le TP1 utilisait un backend Flask qui stockait les messages **en mémoire** (perdus à chaque redémarrage). Pour le TP2, le backend doit pouvoir se connecter à une base **PostgreSQL** via la variable d'environnement `DATABASE_URL`. Si celle-ci est absente, il retombe automatiquement en mode mémoire — ce qui assure la rétrocompatibilité avec le TP1.
+
+### Modifications apportées
+
+**`backend/requirements.txt`** — Ajout de `psycopg2-binary` :
+
+```
+flask==3.0.3
+psycopg2-binary==2.9.9
+```
+
+**`backend/app.py`** — Ajout de la logique de connexion Postgres :
+- Initialisation d'un pool de connexions via `psycopg2` si `DATABASE_URL` est définie
+- Création automatique de la table `messages` au démarrage (`init_db()`)
+- Le champ `backend_mode` du JSON retourne `"postgres"` ou `"memory"` selon le mode actif
+
+### Build et push (multi-architecture)
+
+Comme pour le TP1, on cible explicitement `linux/amd64` et `linux/arm64` pour couvrir les VMs Scaleway et les machines de développement (Mac M1/M2) :
+
+```powershell
+$env:DOCKERHUB_USER = "mdprogra"
+
+docker buildx build --platform linux/amd64,linux/arm64 `
+  -t docker.io/$env:DOCKERHUB_USER/webapp-backend:v2.0 `
+  ./backend --push --no-cache
+```
+
+![Image webapp-backend:v2.0 publiée sur Docker Hub](../../Image/TP2/PreTP/00_docker_hub_v2.png)
+
+✅ **Pré-requis validé** : l'image `mdprogra/webapp-backend:v2.0` est publiée en **public** sur Docker Hub, accessible pour les deux architectures.
+
+
+
