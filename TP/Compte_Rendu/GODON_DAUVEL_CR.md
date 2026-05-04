@@ -149,9 +149,9 @@ godon-k3s-agent-2   Ready    <none>          3m26s   v1.35.4+k3s1
 godon-k3s-server    Ready    control-plane   6m34s   v1.35.4+k3s1
 ```
 
-![Vue d'ensemble du cluster — kubectl get nodes -o wide](../../Image/Bloc1/01_scr_all_k3s.png)
+![VMs Scaleway — infrastructure du cluster](../../Image/Bloc1/01_vms_scaleway.png)
 
-![kubectl get nodes — 3 nœuds Ready](../../Image/Bloc1/02_nodes-ready.png)
+![kubectl get nodes — 3 nœuds Ready](../../Image/Bloc1/02_nodes_ready.png)
 
 ![kubectl get pods -A — pods système Running](../../Image/Bloc1/03_pods_systeme.png)
 
@@ -196,7 +196,7 @@ kubectl delete -f 01-pod.yaml
 
 > Un Pod seul supprimé n'est **pas recréé** — il n'existe pas de contrôleur pour le surveiller. C'est le rôle du Deployment/ReplicaSet.
 
-![Premier Pod simple — kubectl get pods](../../Image/Bloc2/04_pod_simple.png)
+![Pod déclaratif — kubectl get pods](../../Image/Bloc2/01_pod_declaratif.png)
 
 ### Étape 2.2 — Deployment frontend (`02-frontend-deploy.yaml`)
 
@@ -236,7 +236,7 @@ kubectl get deploy,rs,pod
 kubectl rollout status deploy/frontend
 ```
 
-![Deployment frontend — 3 réplicas en Running](../../Image/Bloc2/05_frontend_deploy.png)
+![Deployment frontend — 3 réplicas en Running](../../Image/Bloc2/02_frontend_deployment.png)
 
 ### Étape 2.3 — Auto-réparation
 
@@ -248,6 +248,8 @@ kubectl get pods -l tier=front -w
 ```
 
 On observe la création du pod de remplacement (`hf7pv`) quasi-instantanément.
+
+![Auto-réparation — recréation immédiate du pod supprimé](../../Image/Bloc2/03_auto_reparation.png)
 
 ### Étape 2.4 — Scaling
 
@@ -261,7 +263,7 @@ kubectl scale deploy/frontend --replicas=2
 
 Le scaling est **déclaratif** : on déclare l'état souhaité et Kubernetes s'assure de le respecter. La même opération peut être faite en modifiant `replicas` dans le YAML puis `kubectl apply`.
 
-![Scaling — variation du nombre de réplicas (3 → 5 → 2)](../../Image/Bloc2/06_scaling.png)
+![Scaling — variation du nombre de réplicas (3 → 5 → 2)](../../Image/Bloc2/04_scaling.png)
 
 ### Étape 2.5 — Rolling update & Rollback
 
@@ -277,7 +279,9 @@ kubectl rollout undo deploy/frontend
 
 Le rolling update remplace les pods progressivement **sans interruption de service**. Le rollback revient à la révision précédente en utilisant l'historique des ReplicaSets.
 
-![Rolling update et rollback — historique des révisions](../../Image/Bloc2/07_rolling_update.png)
+![Rolling update — déploiement progressif](../../Image/Bloc2/05_rolling_update.png)
+
+![Rollback — retour à la révision précédente](../../Image/Bloc2/06_rollback.png)
 
 ✅ **Checkpoint 2** : 3 puis 5 puis 2 réplicas observés. Suppression manuelle d'un pod → recréation automatique. Rollback fonctionnel.
 
@@ -315,7 +319,9 @@ kubectl run curl-test --rm -it --image=curlimages/curl:latest -- sh
 # curl http://frontend-svc/
 ```
 
-![Service ClusterIP frontend — kubectl get svc](../../Image/Bloc3/06_clusterip_svc.png)
+![Service ClusterIP frontend — kubectl get svc](../../Image/Bloc3/01_clusterip_svc.png)
+
+![Test ClusterIP depuis un pod éphémère curl-test](../../Image/Bloc3/03_curl_test.png)
 
 ### Étape 3.2 — Service NodePort (`04-frontend-nodeport.yaml`)
 
@@ -337,7 +343,7 @@ spec:
 
 Le frontend est accessible sur `http://212.47.230.56:30080`. À ce stade, le frontend s'affiche mais l'API est cassée — le backend n'est pas encore déployé.
 
-![Frontend accessible dans le navigateur sur :30080](../../Image/Bloc3/07_frontend_navigateur.png)
+![Service NodePort — frontend accessible sur :30080](../../Image/Bloc3/02_nodeport_svc.png)
 
 ✅ **Checkpoint 3** : Service `ClusterIP` joignable depuis un pod du cluster. Frontend accessible sur `:30080` depuis le réseau.
 
@@ -407,7 +413,7 @@ nslookup backend-svc
 wget -qO- http://backend-svc:5000/api/health
 ```
 
-![nslookup backend-svc depuis un pod frontend](../../Image/Bloc4/08_nslookup.png)
+![nslookup backend-svc depuis un pod frontend](../../Image/Bloc4/02_nslookup_dns.png)
 
 ### Étape 4.3 — Test end-to-end
 
@@ -417,7 +423,7 @@ L'application est accessible sur `http://212.47.230.56:30080`. Le livre d'or aff
 kubectl logs -l tier=back -f
 ```
 
-![Livre d'or fonctionnel de bout en bout](../../Image/Bloc4/07_guestbook_fonctionnel.png)
+![Livre d'or fonctionnel de bout en bout](../../Image/Bloc4/01_guestbook_fonctionnel.png)
 
 ### Problème rencontré — ImagePullBackOff sur agent-2
 
