@@ -169,7 +169,7 @@ Comprendre et utiliser les primitives Pod, ReplicaSet, Deployment. Observer l'au
 **1. Pod impératif :**  
 Test de création rapide d'un pod en ligne de commande :
 
-![Création d'un pod en impératif](../../Image/Bloc2/07_pod_imperatif.png.png)
+![Création d'un pod en impératif](../../Image/Bloc2/07_pod_imperatif.png)
 
 **2. Pod déclaratif (`01-pod.yaml`) :**  
 Création d'un pod nginx basique pour comprendre la structure d'un manifest YAML et observer le comportement sans Deployment :
