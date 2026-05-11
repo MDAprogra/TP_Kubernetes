@@ -644,5 +644,429 @@ docker buildx build --platform linux/amd64,linux/arm64 `
 
 ✅ **Pré-requis validé** : l'image `mdprogra/webapp-backend:v2.0` est publiée en **public** sur Docker Hub, accessible pour les deux architectures.
 
+---
 
+## Bloc 5 — Ingress Traefik + TLS
+
+### Objectif
+Remplacer l'accès NodePort par un Ingress Traefik (niveau L7) permettant le routage HTTP par nom d'hôte, puis activer HTTPS avec un certificat TLS auto-signé.
+
+### Étape 5.1 — Concept et inspection de Traefik
+
+Au tableau : les Services opèrent en **L4** (TCP/UDP) — ils exposent un port mais ne connaissent pas le contenu HTTP. Un Ingress opère en **L7** (HTTP) et peut router selon le `Host` ou le chemin URL, ce qui permet de centraliser l'entrée du cluster sur un seul point.
+
+k3s embarque Traefik comme IngressController, déployé dans `kube-system` avec un Service LoadBalancer qui écoute sur `:80` et `:443` de chaque nœud :
+
+```bash
+kubectl get pods -n kube-system | grep traefik
+kubectl get svc -n kube-system traefik
+```
+
+### Étape 5.2 — Premier Ingress, routage par nom d'hôte
+
+Ajout de la résolution DNS locale sur la machine de test :
+
+```bash
+# Linux/macOS : /etc/hosts — Windows : C:\Windows\System32\drivers\etc\hosts
+212.47.230.56  guestbook.labo.local
+```
+
+**`50-ingress.yaml`** :
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: webapp-ingress
+spec:
+  rules:
+  - host: guestbook.labo.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-svc
+            port:
+              number: 80
+```
+
+```bash
+kubectl apply -f 50-ingress.yaml
+kubectl get ingress
+kubectl describe ingress webapp-ingress
+curl -H "Host: guestbook.labo.local" http://212.47.230.56/
+```
+
+![Ingress HTTP — kubectl get ingress et test curl](../../Image/TP2/Bloc5/18_ingress_http.png)
+
+![Navigateur — http://guestbook.labo.local/ fonctionnel](../../Image/TP2/Bloc5/19_ingress_navigateur.png)
+
+### Étape 5.3 — Activation de TLS avec certificat auto-signé
+
+Génération du certificat et création du Secret TLS :
+
+```bash
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout tls.key -out tls.crt \
+  -subj "/CN=guestbook.labo.local/O=labo" \
+  -addext "subjectAltName=DNS:guestbook.labo.local"
+
+kubectl create secret tls guestbook-tls \
+  --cert=tls.crt --key=tls.key
+kubectl get secret guestbook-tls
+```
+
+![Secret TLS guestbook-tls créé dans le namespace guestbook](../../Image/TP2/Bloc5/20_tls_secret.png)
+
+Mise à jour de l'Ingress via **`51-ingress-tls.yaml`** — l'annotation active l'écoute sur les deux entrypoints Traefik (`web` port 80 et `websecure` port 443) :
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: webapp-ingress
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+spec:
+  tls:
+  - hosts:
+    - guestbook.labo.local
+    secretName: guestbook-tls
+  rules:
+  - host: guestbook.labo.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-svc
+            port:
+              number: 80
+```
+
+```bash
+kubectl apply -f 51-ingress-tls.yaml
+curl -k https://guestbook.labo.local/
+```
+
+![Ingress TLS — kubectl describe avec section TLS active](../../Image/TP2/Bloc5/21_ingress_tls.png)
+
+![Navigateur — https://guestbook.labo.local/ avec avertissement cert auto-signé](../../Image/TP2/Bloc5/22_https_navigateur.png)
+
+L'avertissement du navigateur est attendu : le certificat est auto-signé et n'est pas reconnu par une CA de confiance. En production, on utiliserait `cert-manager` avec Let's Encrypt pour obtenir un certificat valide automatiquement.
+
+> **Piège rencontré** : le Secret TLS doit être dans le **même namespace** que l'Ingress. Un Secret créé dans `default` pour un Ingress dans `guestbook` est silencieusement ignoré par Traefik, qui sert alors du HTTP nu sur le port 443.
+
+✅ **Checkpoint 5** : le livre d'or est joignable via `http://guestbook.labo.local/`. HTTPS fonctionne avec l'avertissement de certificat auto-signé attendu.
+
+---
+
+## Bloc 6 — NetworkPolicies
+
+### Objectif
+Sécuriser le trafic intra-cluster avec des NetworkPolicies : appliquer un *default-deny* sur tout le namespace, puis rouvrir uniquement les flux légitimes (Traefik → frontend → backend → Postgres), et vérifier qu'un pod intrus ne peut plus joindre Postgres.
+
+### Étape 6.1 — Vérifier que le CNI applique les policies
+
+k3s utilise flannel + kube-router (depuis k3s v1.21) pour appliquer les NetworkPolicies :
+
+```bash
+kubectl get pods -n kube-system | grep -E "flannel|kube-router"
+```
+
+Si `kube-router` n'apparaît pas, vérifier que k3s n'a pas été démarré avec `--disable-network-policy`.
+
+### Étape 6.2 — Tester l'absence d'isolation (avant policy)
+
+Avant toute NetworkPolicy, n'importe quel pod peut joindre Postgres directement :
+
+```bash
+kubectl run pwn --rm -it --image=postgres:16-alpine -- sh
+# psql -h postgres-0.postgres-svc -U guestbook -d guestbook
+# (mot de passe : ChangeMe_inTP2!)
+# SELECT * FROM messages;
+# exit
+```
+
+![Avant NetworkPolicy — le pod intrus pwn peut accéder à Postgres](../../Image/TP2/Bloc6/23_avant_network_policy.png)
+
+Constat : aucune isolation par défaut. Tout pod dans le namespace peut interroger la base de données — comportement dangereux en environnement multi-tenant.
+
+### Étape 6.3 — Default-deny et rupture volontaire
+
+**`60-default-deny.yaml`** — bloque tout le trafic entrant et sortant sur tous les pods du namespace :
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+```
+
+```bash
+kubectl apply -f 60-default-deny.yaml
+curl -k https://guestbook.labo.local/   # → timeout ou 502
+```
+
+![Après default-deny — le livre d'or est cassé (502)](../../Image/TP2/Bloc6/24_default_deny.png)
+
+Le livre d'or est intentionnellement cassé : c'est le moment pédagogique qui montre que sans règles d'autorisation, rien ne passe — y compris la résolution DNS (port 53/UDP).
+
+### Étape 6.4 — Règles d'autorisation ciblées
+
+**`61-allow-rules.yaml`** contient 6 NetworkPolicies distinctes :
+
+| Policy | Effet |
+|---|---|
+| `allow-dns` | Autorise tout pod à atteindre kube-dns (UDP 53) — indispensable |
+| `allow-ingress-to-frontend` | Traefik peut atteindre le frontend (port 80) |
+| `allow-front-to-back` | Frontend peut atteindre le backend (port 5000) |
+| `allow-back-to-postgres` | Backend peut atteindre Postgres (port 5432) |
+| `allow-front-egress` | Frontend peut sortir vers le backend |
+| `allow-back-egress` | Backend peut sortir vers Postgres |
+
+```yaml
+# Extrait — policy DNS (sans elle, tout reste cassé même après allow)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+```
+
+```bash
+kubectl apply -f 61-allow-rules.yaml
+curl -k https://guestbook.labo.local/   # → à nouveau OK
+```
+
+![Après allow-rules — livre d'or fonctionnel avec NetworkPolicies actives](../../Image/TP2/Bloc6/25_allow_rules.png)
+
+### Étape 6.5 — Vérification de l'isolation
+
+```bash
+kubectl run pwn --rm -it --image=postgres:16-alpine -- sh
+# psql -h postgres-0.postgres-svc -U guestbook -d guestbook
+# → connection timeout : la NetworkPolicy bloque le pod intrus
+```
+
+![Pod intrus pwn bloqué — timeout à la connexion Postgres](../../Image/TP2/Bloc6/26_pod_intrus_bloque.png)
+
+Le pod `pwn` n'a pas le label `tier=back`, donc aucune policy ne l'autorise à joindre Postgres sur le port 5432. La protection est effective.
+
+> **Piège critique** : la policy `allow-dns` est la première à appliquer après le *default-deny*. Sans elle, les pods ne résolvent plus aucun nom DNS et l'application reste cassée même quand toutes les autres rules sont correctes.
+
+✅ **Checkpoint 6** : le livre d'or fonctionne avec les NetworkPolicies actives. Un pod sans label `tier=back` ne peut plus joindre Postgres.
+
+---
+
+## Bloc 7 — Défis ouverts
+
+### Défi A — Init container et migration SQL
+
+#### Objectif
+Ajouter un `initContainer` au Deployment backend qui exécute une migration SQL (création d'un index sur `created_at`) avant le démarrage du conteneur principal. L'init container garantit que la migration est appliquée avant que l'application ne commence à recevoir des requêtes.
+
+#### Concept
+
+Un `initContainer` s'exécute à sa completion avant le démarrage des conteneurs du pod. S'il échoue, Kubernetes redémarre le pod — ce qui en fait un outil fiable pour les migrations de schéma.
+
+#### YAML — extrait de `defis/defi-A.yaml`
+
+```yaml
+spec:
+  initContainers:
+  - name: migrate
+    image: postgres:16-alpine
+    env:
+    - name: PGPASSWORD
+      valueFrom:
+        secretKeyRef: { name: postgres-credentials, key: POSTGRES_PASSWORD }
+    command:
+    - sh
+    - -c
+    - |
+      until pg_isready -h postgres-0.postgres-svc -U guestbook; do
+        echo "Waiting for postgres..."; sleep 2
+      done
+      psql -h postgres-0.postgres-svc -U guestbook -d guestbook -c \
+        "CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);"
+      echo "Migration done."
+  containers:
+  - name: backend
+    image: docker.io/mdprogra/webapp-backend:v2.0
+    # ... (identique à 40-backend-v2.yaml)
+```
+
+#### Vérification
+
+```bash
+kubectl apply -f defis/defi-A.yaml
+kubectl get pods -l tier=back -w
+# → Init:0/1 pendant l'exécution de la migration, puis Running
+kubectl logs <pod-backend> -c migrate
+```
+
+![Pod backend en Init:0/1 — init container de migration en cours](../../Image/TP2/Bloc7/27_defi_A_init.png)
+
+![Logs du migrate initContainer — migration SQL exécutée avec succès](../../Image/TP2/Bloc7/28_defi_A_migration_logs.png)
+
+✅ **Défi A validé** : l'index `idx_messages_created_at` est créé avant le démarrage du backend. En cas d'échec de la migration (Postgres indisponible), le pod reste en `Init:CrashLoopBackOff` et le conteneur principal ne démarre pas — comportement de sécurité souhaité.
+
+---
+
+### Défi C — Ingress path-based multi-app
+
+#### Objectif
+Déployer une seconde application (`nginx` servant une page « admin ») et configurer l'Ingress pour router `/admin/` vers cette nouvelle app, tandis que `/` continue de pointer vers le frontend principal — le tout sur le même nom d'hôte `guestbook.labo.local`.
+
+#### Déploiement de l'app admin
+
+```yaml
+# defis/defi-C-admin.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: admin-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: admin }
+  template:
+    metadata:
+      labels: { app: admin }
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.27-alpine
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: html
+          mountPath: /usr/share/nginx/html
+      volumes:
+      - name: html
+        configMap:
+          name: admin-html
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: admin-html
+data:
+  index.html: |
+    <html><body><h1>Interface Admin</h1><p>Espace réservé.</p></body></html>
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: admin-svc
+spec:
+  selector: { app: admin }
+  ports:
+  - port: 80
+    targetPort: 80
+```
+
+#### Ingress path-based
+
+**`defis/defi-C-ingress.yaml`** — deux `paths` sur le même `host` :
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: webapp-ingress
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+spec:
+  tls:
+  - hosts: [guestbook.labo.local]
+    secretName: guestbook-tls
+  rules:
+  - host: guestbook.labo.local
+    http:
+      paths:
+      - path: /admin/
+        pathType: Prefix
+        backend:
+          service:
+            name: admin-svc
+            port:
+              number: 80
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-svc
+            port:
+              number: 80
+```
+
+> **Ordre des paths** : Traefik évalue les rules du plus spécifique au moins spécifique. `/admin/` doit apparaître **avant** `/` pour être correctement matché.
+
+```bash
+kubectl apply -f defis/defi-C-admin.yaml
+kubectl apply -f defis/defi-C-ingress.yaml
+curl -k https://guestbook.labo.local/admin/
+curl -k https://guestbook.labo.local/
+```
+
+![Ingress path-based — deux backends sur le même host](../../Image/TP2/Bloc7/29_defi_C_ingress.png)
+
+![Navigateur — /admin/ sert la page admin, / sert le livre d'or](../../Image/TP2/Bloc7/30_defi_C_navigateur.png)
+
+✅ **Défi C validé** : `https://guestbook.labo.local/admin/` route vers l'app admin et `https://guestbook.labo.local/` continue de servir le livre d'or. Les deux coexistent sur le même Ingress et le même certificat TLS.
+
+---
+
+## Synthèse des commandes TP2
+
+| Commande | Description |
+|---|---|
+| `kubectl create namespace <ns>` | Créer un namespace |
+| `kubectl config set-context --current --namespace=<ns>` | Changer de namespace courant |
+| `kubectl create configmap <nom> --from-literal=K=V` | ConfigMap impératif |
+| `kubectl get cm,secret` | Lister ConfigMaps et Secrets |
+| `kubectl get sc` | Lister les StorageClasses |
+| `kubectl get pv,pvc` | Lister PersistentVolumes et Claims |
+| `kubectl get sts` | Lister les StatefulSets |
+| `kubectl exec -it postgres-0 -- psql -U guestbook -d guestbook` | Console psql dans postgres-0 |
+| `kubectl rollout restart deploy/<nom>` | Forcer le redémarrage d'un Deployment |
+| `kubectl get ingress` | Lister les Ingress |
+| `kubectl describe ingress <nom>` | Détails et events d'un Ingress |
+| `kubectl get networkpolicy` | Lister les NetworkPolicies |
+
+---
+
+## Pièges rencontrés — TP2
+
+| Symptôme | Cause | Résolution |
+|---|---|---|
+| `initdb` échoue dans postgres-0 | `subPath` manquant — répertoire mountpoint non vide | Ajouter `subPath: pgdata` dans `volumeMounts` |
+| `DATABASE_URL` non interpolée, backend en mode mémoire | Ordre des `env` incorrect | Définir `DB_USER`, `DB_PASS`, `DB_NAME` **avant** `DATABASE_URL` |
+| PVC en `Pending` éternel | `WaitForFirstConsumer` — aucun pod ne réclame encore le volume | Normal ; vérifier le nom exact de la StorageClass (`local-path`) |
+| PVC orphelins après `kubectl delete sts` | Les PVC ne sont pas supprimés automatiquement par le StatefulSet | `kubectl delete pvc data-postgres-0` à la main |
+| 404 sur l'Ingress | Mauvais `host` ou DNS non configuré dans `/etc/hosts` | Tester avec `curl -H "Host: guestbook.labo.local"`, vérifier `kubectl describe ingress` |
+| HTTPS ne fonctionne pas | Secret TLS dans un namespace différent de l'Ingress | Créer le Secret dans le même namespace que l'Ingress |
+| Tout cassé après default-deny | DNS bloqué (port 53/UDP vers kube-dns) | Appliquer `allow-dns` en **premier** |
+| Pod intrus toujours connecté après NetworkPolicy | Labels du pod ne matchent pas les selectors | Vérifier les labels avec `kubectl get pod --show-labels` |
 

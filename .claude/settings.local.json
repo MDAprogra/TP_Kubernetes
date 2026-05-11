@@ -5,7 +5,11 @@
       "Bash(mv 'C:/Users/Corentin Godon/Desktop/MediaSchool/Mastere1/Cours/Cours/Arthur Baradel/Kubernetes/TP_Kubernetes/Image/Bloc1/02_nodes-ready.png' 'C:/Users/Corentin Godon/Desktop/MediaSchool/Mastere1/Cours/Cours/Arthur Baradel/Kubernetes/TP_Kubernetes/Image/Bloc1/02_nodes_ready.png')",
       "Bash(mv 'C:/Users/Corentin Godon/Desktop/MediaSchool/Mastere1/Cours/Cours/Arthur Baradel/Kubernetes/TP_Kubernetes/Image/Bloc2/04_pod_simple.png' 'C:/Users/Corentin Godon/Desktop/MediaSchool/Mastere1/Cours/Cours/Arthur Baradel/Kubernetes/TP_Kubernetes/Image/Bloc2/01_pod_declaratif.png')",
       "Bash(mv 'C:/Users/Corentin Godon/Desktop/MediaSchool/Mastere1/Cours/Cours/Arthur Baradel/Kubernetes/TP_Kubernetes/Image/Bloc2/05_frontend_deploy.png' 'C:/Users/Corentin Godon/Desktop/MediaSchool/Mastere1/Cours/Cours/Arthur Baradel/Kubernetes/TP_Kubernetes/Image/Bloc2/02_frontend_deployment.png')",
-      "Bash(mv 'C:/Users/Corentin Godon/Desktop/MediaSchool/Mastere1/Cours/Cours/Arthur Baradel/Kubernetes/TP_Kubernetes/Image/Bloc2/06_scaling.png' 'C:/Users/Corentin Godon/Desktop/MediaSchool/Mastere1/Cours/Cours/Arthur Baradel/Kubernetes/TP_Kubernetes/Image/Bloc2/03_auto_reparation.png')"
+      "Bash(mv 'C:/Users/Corentin Godon/Desktop/MediaSchool/Mastere1/Cours/Cours/Arthur Baradel/Kubernetes/TP_Kubernetes/Image/Bloc2/06_scaling.png' 'C:/Users/Corentin Godon/Desktop/MediaSchool/Mastere1/Cours/Cours/Arthur Baradel/Kubernetes/TP_Kubernetes/Image/Bloc2/03_auto_reparation.png')",
+      "Bash(git add *)",
+      "Bash(git pull *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)"
     ]
   }
 }
