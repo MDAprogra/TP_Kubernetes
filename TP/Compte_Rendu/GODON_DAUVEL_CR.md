@@ -644,5 +644,596 @@ docker buildx build --platform linux/amd64,linux/arm64 `
 
 ✅ **Pré-requis validé** : l'image `mdprogra/webapp-backend:v2.0` est publiée en **public** sur Docker Hub, accessible pour les deux architectures.
 
+---
 
+## Bloc 1 — ConfigMaps & Secrets
+
+### Objectif
+Externaliser la configuration applicative et les credentials hors du code source. Comprendre les différences entre ConfigMap (données publiques) et Secret (données sensibles), et les différentes méthodes de création.
+
+### Étape 1.1 — Namespace dédié
+
+Pour isoler les ressources du TP2 du namespace `default`, on crée un namespace `guestbook` et on le définit comme contexte courant :
+
+```bash
+kubectl create namespace guestbook
+kubectl config set-context --current --namespace=guestbook
+kubectl config view --minify | grep namespace
+```
+
+Toutes les commandes suivantes opèrent dans ce namespace.
+
+### Étape 1.2 — ConfigMap : trois méthodes de création
+
+**Méthode 1 — impérative (littéraux)** :
+
+```bash
+kubectl create configmap demo-cm \
+  --from-literal=APP_ENV=tp2 \
+  --from-literal=LOG_LEVEL=info
+kubectl get cm demo-cm -o yaml
+kubectl delete cm demo-cm
+```
+
+![ConfigMap créé en impératif](../../Image/TP2/Bloc1/01_configmap_imperatif.png)
+
+**Méthode 2 — à partir d'un fichier** :
+
+```bash
+echo "welcome=Bienvenue sur le livre d'or persistant !" > app.properties
+kubectl create configmap demo-cm --from-file=app.properties
+kubectl get cm demo-cm -o yaml
+kubectl delete cm demo-cm
+```
+
+![ConfigMap créé depuis un fichier](../../Image/TP2/Bloc1/02_configmap_fichier.png)
+
+**Méthode 3 — déclarative (privilégiée)** via `10-configmap.yaml` :
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webapp-config
+data:
+  APP_ENV: "tp2-prod"
+  WELCOME_MESSAGE: "Bienvenue sur le livre d'or persistant !"
+  LOG_LEVEL: "info"
+```
+
+```bash
+kubectl apply -f 10-configmap.yaml
+kubectl describe cm webapp-config
+```
+
+![ConfigMap déclaratif — webapp-config créé](../../Image/TP2/Bloc1/03_configmap_declaratif.png)
+
+### Étape 1.3 — Secret : credentials Postgres
+
+Le Secret est encodé en **base64**, pas chiffré — quiconque a accès à l'API Kubernetes peut décoder les valeurs. En production, il faudrait coupler avec `EncryptionConfiguration` ou un gestionnaire externe (Vault, Sealed Secrets).
+
+`11-secret.yaml` utilise `stringData` (Kubernetes encode lui-même) plutôt que `data` (qui exigerait du base64 manuel) :
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-credentials
+type: Opaque
+stringData:
+  POSTGRES_USER: "guestbook"
+  POSTGRES_PASSWORD: "ChangeMe_inTP2!"
+  POSTGRES_DB: "guestbook"
+```
+
+```bash
+kubectl apply -f 11-secret.yaml
+kubectl get secret postgres-credentials -o yaml
+echo "Z3Vlc3Rib29r" | base64 -d   # → guestbook
+```
+
+![Secret postgres-credentials — valeurs encodées en base64](../../Image/TP2/Bloc1/04_secret.png)
+
+### Étape 1.4 — Injection de la config dans un pod test
+
+Le pod `config-tester` (`12-test-config.yaml`) injecte le ConfigMap et le Secret comme variables d'environnement, et monte le ConfigMap en volume :
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: config-tester
+spec:
+  containers:
+  - name: app
+    image: busybox:1.36
+    command: ["sh", "-c", "env | sort && sleep 3600"]
+    envFrom:
+    - configMapRef:
+        name: webapp-config
+    - secretRef:
+        name: postgres-credentials
+    volumeMounts:
+    - name: cfg-vol
+      mountPath: /etc/cfg
+  volumes:
+  - name: cfg-vol
+    configMap:
+      name: webapp-config
+```
+
+```bash
+kubectl apply -f 12-test-config.yaml
+kubectl logs config-tester | grep -E "APP_ENV|WELCOME|POSTGRES"
+kubectl exec config-tester -- ls /etc/cfg
+kubectl exec config-tester -- cat /etc/cfg/WELCOME_MESSAGE
+kubectl delete -f 12-test-config.yaml
+```
+
+![Pod config-tester — variables d'environnement et volume ConfigMap visibles](../../Image/TP2/Bloc1/05_pod_test_config.png)
+
+![Checkpoint 1 — ConfigMap et Secret opérationnels](../../Image/TP2/Bloc1/06_checkpoint1.png)
+
+> **Piège rencontré** : modifier un ConfigMap ne redémarre pas automatiquement les pods qui l'utilisent. Il faut déclencher un `kubectl rollout restart deploy/<nom>` manuellement.
+
+✅ **Checkpoint 1** : ConfigMap `webapp-config` et Secret `postgres-credentials` créés dans le namespace `guestbook`. Le pod test affiche les variables attendues et accède au ConfigMap monté en volume.
+
+---
+
+## Bloc 2 — PV / PVC / StorageClass
+
+### Objectif
+Comprendre le modèle de stockage persistant de Kubernetes : PersistentVolume (PV), PersistentVolumeClaim (PVC) et StorageClass. Observer le provisionnement dynamique de k3s et démontrer la survie des données après suppression d'un pod.
+
+### Étape 2.1 — Inspection de ce qui existe en k3s
+
+k3s embarque `local-path-provisioner` qui crée des PV automatiquement sur le disque du nœud hébergeant le pod :
+
+```bash
+kubectl get sc
+kubectl describe sc local-path
+kubectl get pv     # vide initialement
+kubectl get pvc -A
+```
+
+![StorageClass local-path — provisionnement dynamique WaitForFirstConsumer](../../Image/TP2/Bloc2/07_storageclass.png)
+
+Points clés observés :
+- `Provisioner: rancher.io/local-path`
+- `ReclaimPolicy: Delete` — le PV est supprimé avec le PVC
+- `volumeBindingMode: WaitForFirstConsumer` — le PV n'est créé qu'au moment où un pod le réclame, pour garantir la colocalisation pod/volume sur le même nœud
+
+### Étape 2.2 — Premier PVC et démonstration de WaitForFirstConsumer
+
+**`20-pvc-demo.yaml`** :
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: demo-pvc
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 200Mi
+```
+
+```bash
+kubectl apply -f 20-pvc-demo.yaml
+kubectl get pvc    # → Pending (aucun pod ne l'utilise encore)
+kubectl get pv     # → toujours vide
+```
+
+![PVC demo-pvc en Pending — WaitForFirstConsumer en action](../../Image/TP2/Bloc2/08_pvc_pending.png)
+
+Après attachement au pod `writer` (`21-pod-pvc.yaml`) :
+
+```bash
+kubectl apply -f 21-pod-pvc.yaml
+kubectl get pv     # → un PV apparaît, lié au PVC
+kubectl exec writer -- cat /data/log.txt
+```
+
+![PVC Bound après attachement au pod — PV créé dynamiquement](../../Image/TP2/Bloc2/09_pvc_bound.png)
+
+### Étape 2.3 — Démonstration de la persistance
+
+```bash
+kubectl delete pod writer
+kubectl apply -f 21-pod-pvc.yaml
+kubectl exec writer -- cat /data/log.txt
+# La ligne du run précédent est toujours présente
+```
+
+Les données survivent à la suppression du pod : seul le PVC et le PV doivent être supprimés pour libérer le stockage.
+
+```bash
+kubectl delete -f 21-pod-pvc.yaml
+kubectl delete -f 20-pvc-demo.yaml
+```
+
+> **Piège rencontré** : avec `accessModes: ReadWriteOnce`, le volume ne peut être monté que par **un seul pod à la fois**. Tenter de scaler un Deployment avec un PVC `local-path` en RWO provoque un blocage immédiat.
+
+✅ **Checkpoint 2** : PVC créé, PV provisionné dynamiquement à la première utilisation. Données persistantes après suppression du pod. Comportement `WaitForFirstConsumer` observé.
+
+---
+
+## Bloc 3 — StatefulSet Postgres
+
+### Objectif
+Déployer PostgreSQL en StatefulSet pour bénéficier d'une identité réseau stable, d'un volume dédié par réplica, et d'un démarrage/arrêt ordonné — caractéristiques essentielles pour les bases de données.
+
+### Étape 3.1 — Pourquoi un StatefulSet ?
+
+Contrairement aux Deployments (pods interchangeables), un StatefulSet garantit :
+- **Identité stable** : `postgres-0`, `postgres-1`, …
+- **Volume dédié par réplica** via `volumeClaimTemplates`
+- **DNS prédictible** : `postgres-0.postgres-svc.<namespace>.svc.cluster.local`
+- **Ordonnancement** : `postgres-0` démarre avant `postgres-1`
+
+### Étape 3.2 — Headless Service + StatefulSet
+
+**`30-postgres.yaml`** — Le service `clusterIP: None` (headless) permet la résolution DNS directe vers les pods nommés, sans passer par une VIP :
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-svc
+  labels: { app: postgres }
+spec:
+  clusterIP: None
+  selector: { app: postgres }
+  ports:
+  - port: 5432
+    targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres-svc
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:16-alpine
+        envFrom:
+        - secretRef:
+            name: postgres-credentials
+        ports:
+        - containerPort: 5432
+          name: pg
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+          subPath: pgdata
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "guestbook"]
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          requests: { cpu: "100m", memory: "256Mi" }
+          limits:   { cpu: "500m", memory: "512Mi" }
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: local-path
+      resources:
+        requests:
+          storage: 1Gi
+```
+
+> Le `subPath: pgdata` est indispensable : sans lui, `initdb` échoue car il détecte un répertoire `lost+found` dans le mountpoint et considère le répertoire non vide.
+
+```bash
+kubectl apply -f 30-postgres.yaml
+kubectl get sts,pod,pvc,svc -l app=postgres
+kubectl describe sts postgres
+```
+
+![StatefulSet postgres-0 en Running avec PVC data-postgres-0 lié](../../Image/TP2/Bloc3/10_postgres_running.png)
+
+![PVC data-postgres-0 — 1Gi Bound](../../Image/TP2/Bloc3/11_postgres_pvc.png)
+
+### Étape 3.3 — Vérification de Postgres et résolution DNS
+
+```bash
+kubectl exec -it postgres-0 -- psql -U guestbook -d guestbook -c "\dt"
+kubectl exec -it postgres-0 -- psql -U guestbook -d guestbook -c \
+  "CREATE TABLE test(id INT); INSERT INTO test VALUES (1); SELECT * FROM test;"
+```
+
+Test DNS depuis un pod éphémère :
+
+```bash
+kubectl run dns-test --rm -it --image=busybox:1.36 -- sh
+# nslookup postgres-svc
+# nslookup postgres-0.postgres-svc
+```
+
+![Connexion psql à postgres-0 — DNS headless résolu](../../Image/TP2/Bloc3/12_postgres_connect.png)
+
+### Étape 3.4 — Test de persistance
+
+```bash
+kubectl exec postgres-0 -- psql -U guestbook -d guestbook -c "INSERT INTO test VALUES (42);"
+kubectl delete pod postgres-0
+kubectl get pod postgres-0 -w   # recréation par le StatefulSet controller
+kubectl exec postgres-0 -- psql -U guestbook -d guestbook -c "SELECT * FROM test;"
+# → les valeurs 1 et 42 sont toujours présentes
+```
+
+> **Piège rencontré** : supprimer un StatefulSet avec `kubectl delete sts postgres` ne supprime **pas** les PVC. Les volumes `data-postgres-0` persistent et doivent être supprimés manuellement avec `kubectl delete pvc data-postgres-0` si l'on souhaite repartir de zéro.
+
+✅ **Checkpoint 3** : `postgres-0` en Running, PVC `data-postgres-0` lié. DNS `postgres-0.postgres-svc` résolvable. Données persistantes après suppression et recréation du pod.
+
+---
+
+## Bloc 4 — Backend v2 connecté à Postgres
+
+### Objectif
+Déployer le backend v2.0 en le connectant à PostgreSQL via ConfigMap et Secret, puis démontrer que les messages du livre d'or survivent aux redémarrages du backend.
+
+### Étape 4.1 — Deployment backend v2
+
+**`40-backend-v2.yaml`** — L'ordre des variables `env` est crucial : `DB_USER`, `DB_PASS` et `DB_NAME` doivent être définis **avant** `DATABASE_URL` pour que la substitution `$(...)` fonctionne :
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  labels: { app: webapp, tier: back }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: webapp, tier: back }
+  template:
+    metadata:
+      labels: { app: webapp, tier: back }
+    spec:
+      containers:
+      - name: backend
+        image: docker.io/mdprogra/webapp-backend:v2.0
+        ports:
+        - containerPort: 5000
+        envFrom:
+        - configMapRef:
+            name: webapp-config
+        env:
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef: { name: postgres-credentials, key: POSTGRES_USER }
+        - name: DB_PASS
+          valueFrom:
+            secretKeyRef: { name: postgres-credentials, key: POSTGRES_PASSWORD }
+        - name: DB_NAME
+          valueFrom:
+            secretKeyRef: { name: postgres-credentials, key: POSTGRES_DB }
+        - name: DATABASE_URL
+          value: "postgresql://$(DB_USER):$(DB_PASS)@postgres-0.postgres-svc:5432/$(DB_NAME)"
+        readinessProbe:
+          httpGet: { path: /api/health, port: 5000 }
+          initialDelaySeconds: 5
+        resources:
+          requests: { cpu: "50m", memory: "64Mi" }
+          limits:   { cpu: "200m", memory: "256Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-svc
+spec:
+  selector: { app: webapp, tier: back }
+  ports:
+  - port: 5000
+    targetPort: 5000
+```
+
+```bash
+kubectl apply -f 40-backend-v2.yaml
+kubectl rollout status deploy/backend
+kubectl logs -l tier=back
+```
+
+![Backend v2 — 2 pods en Running, connectés à Postgres](../../Image/TP2/Bloc4/13_backend_v2_running.png)
+
+### Étape 4.2 — Redéploiement du frontend
+
+Le frontend ne change pas par rapport au TP1. On réapplique les manifests existants (le `nginx.conf` continue de proxier vers `backend-svc:5000`) :
+
+```bash
+kubectl apply -f 02-frontend-deploy.yaml
+kubectl apply -f 03-frontend-svc.yaml
+```
+
+![Frontend déployé dans le namespace guestbook](../../Image/TP2/Bloc4/15_frontend_running.png)
+
+### Étape 4.3 — Test complet et démonstration de persistance
+
+Accès temporaire via port-forward :
+
+```bash
+kubectl port-forward svc/frontend-svc 8080:80 --address 0.0.0.0
+```
+
+Après avoir posté 3 messages depuis le navigateur :
+
+```bash
+kubectl rollout restart deploy/backend
+kubectl rollout status deploy/backend
+```
+
+![Livre d'or v2 — interface avec backend_mode: postgres](../../Image/TP2/Bloc4/16_guestbook_v2.png)
+
+Les messages sont **toujours présents** après le rollout restart — contrairement au TP1 où ils étaient perdus. La vérification directe en SQL confirme :
+
+```bash
+kubectl exec postgres-0 -- psql -U guestbook -d guestbook -c "SELECT * FROM messages;"
+```
+
+![Table messages PostgreSQL — données persistées](../../Image/TP2/Bloc4/14_postgres_table.png)
+
+![Persistance vérifiée — messages survivent au rollout restart](../../Image/TP2/Bloc4/17_persistance.png)
+
+> **Moment pédagogique clé** : le champ `backend_mode` de la réponse JSON renvoie `"postgres"` (et non `"memory"` comme en TP1), confirmant que le backend utilise bien la base de données.
+
+✅ **Checkpoint 4** : le livre d'or persiste à travers les redémarrages. `backend_mode: "postgres"` confirmé. Messages visibles dans la table SQL.
+
+---
+
+## Bloc 5 — Ingress Traefik + TLS
+
+### Objectif
+Remplacer l'accès NodePort par un Ingress Traefik (niveau L7) permettant le routage HTTP par nom d'hôte, puis activer HTTPS avec un certificat auto-signé.
+
+### Étape 5.1 — Inspection de Traefik
+
+k3s embarque Traefik comme IngressController. Il est déployé dans `kube-system` et écoute sur les ports 80 et 443 de chaque nœud via un Service LoadBalancer :
+
+```bash
+kubectl get pods -n kube-system | grep traefik
+kubectl get svc -n kube-system traefik
+```
+
+Différence fondamentale : les Services opèrent en **L4** (TCP/UDP), tandis qu'un Ingress opère en **L7** (HTTP) et peut router en fonction du `Host` ou du chemin.
+
+### Étape 5.2 — Premier Ingress, routage par nom d'hôte
+
+Ajout dans `/etc/hosts` sur la machine de test :
+
+```
+212.47.230.56  guestbook.labo.local
+```
+
+**`50-ingress.yaml`** :
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: webapp-ingress
+spec:
+  rules:
+  - host: guestbook.labo.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-svc
+            port:
+              number: 80
+```
+
+```bash
+kubectl apply -f 50-ingress.yaml
+kubectl get ingress
+kubectl describe ingress webapp-ingress
+curl -H "Host: guestbook.labo.local" http://212.47.230.56/
+```
+
+![Ingress HTTP — livre d'or accessible sur guestbook.labo.local](../../Image/TP2/Bloc5/18_ingress_http.png)
+
+![Navigateur — http://guestbook.labo.local/ fonctionnel](../../Image/TP2/Bloc5/19_ingress_navigateur.png)
+
+### Étape 5.3 — Activation de TLS avec certificat auto-signé
+
+Génération du certificat et création du Secret TLS :
+
+```bash
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout tls.key -out tls.crt \
+  -subj "/CN=guestbook.labo.local/O=labo" \
+  -addext "subjectAltName=DNS:guestbook.labo.local"
+
+kubectl create secret tls guestbook-tls \
+  --cert=tls.crt --key=tls.key
+kubectl get secret guestbook-tls
+```
+
+![Secret TLS guestbook-tls créé dans le namespace guestbook](../../Image/TP2/Bloc5/20_tls_secret.png)
+
+Mise à jour de l'Ingress via **`51-ingress-tls.yaml`** — l'annotation `traefik.ingress.kubernetes.io/router.entrypoints` active l'écoute sur les deux entrypoints :
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: webapp-ingress
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+spec:
+  tls:
+  - hosts:
+    - guestbook.labo.local
+    secretName: guestbook-tls
+  rules:
+  - host: guestbook.labo.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-svc
+            port:
+              number: 80
+```
+
+```bash
+kubectl apply -f 51-ingress-tls.yaml
+curl -k https://guestbook.labo.local/
+```
+
+L'avertissement de certificat dans le navigateur est attendu (cert auto-signé non reconnu par une CA de confiance). En production, on utiliserait `cert-manager` avec Let's Encrypt.
+
+> **Piège rencontré** : le Secret TLS doit être dans le **même namespace** que l'Ingress. Un Secret dans `default` pour un Ingress dans `guestbook` est silencieusement ignoré par Traefik.
+
+✅ **Checkpoint 5** : le livre d'or est joignable via `http://guestbook.labo.local/`. HTTPS fonctionne avec l'avertissement de certificat auto-signé attendu.
+
+---
+
+## Synthèse des commandes TP2
+
+| Commande | Description |
+|---|---|
+| `kubectl create namespace <ns>` | Créer un namespace |
+| `kubectl config set-context --current --namespace=<ns>` | Changer de namespace courant |
+| `kubectl create configmap <nom> --from-literal=K=V` | ConfigMap impératif |
+| `kubectl create configmap <nom> --from-file=<fichier>` | ConfigMap depuis un fichier |
+| `kubectl get cm,secret` | Lister ConfigMaps et Secrets |
+| `kubectl get sc` | Lister les StorageClasses |
+| `kubectl get pv,pvc` | Lister PersistentVolumes et Claims |
+| `kubectl get sts` | Lister les StatefulSets |
+| `kubectl exec -it postgres-0 -- psql -U guestbook -d guestbook` | Console psql dans le pod Postgres |
+| `kubectl rollout restart deploy/<nom>` | Forcer le redémarrage d'un Deployment |
+| `kubectl get ingress` | Lister les Ingress |
+| `kubectl describe ingress <nom>` | Détails d'un Ingress |
+
+---
+
+## Pièges rencontrés — TP2
+
+| Symptôme | Cause | Résolution |
+|---|---|---|
+| `initdb` échoue dans postgres-0 | `subPath` manquant (répertoire non vide) | Ajouter `subPath: pgdata` dans `volumeMounts` |
+| `DATABASE_URL` non interpolée | Ordre des `env` incorrect | Définir `DB_USER`, `DB_PASS`, `DB_NAME` avant `DATABASE_URL` |
+| PVC en `Pending` éternel | `WaitForFirstConsumer` — aucun pod ne réclame le volume | Normal jusqu'au déploiement du pod ; vérifier le nom de la StorageClass |
+| Données perdues après `kubectl delete sts` | Les PVC ne sont pas supprimés automatiquement | Supprimer manuellement avec `kubectl delete pvc data-postgres-0` |
+| 404 sur l'Ingress | Mauvais `host` ou DNS non configuré dans `/etc/hosts` | `curl -H "Host: guestbook.labo.local"` pour tester, vérifier `kubectl describe ingress` |
+| HTTPS ne fonctionne pas | Secret TLS dans un namespace différent de l'Ingress | Créer le Secret dans le même namespace que l'Ingress |
 
