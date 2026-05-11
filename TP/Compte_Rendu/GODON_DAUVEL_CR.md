@@ -1070,3 +1070,700 @@ curl -k https://guestbook.labo.local/
 | Tout cassé après default-deny | DNS bloqué (port 53/UDP vers kube-dns) | Appliquer `allow-dns` en **premier** |
 | Pod intrus toujours connecté après NetworkPolicy | Labels du pod ne matchent pas les selectors | Vérifier les labels avec `kubectl get pod --show-labels` |
 
+---
+---
+
+# Compte Rendu — TP3 Kubernetes
+**Binôme : Corentin GODON & Matthias DAUVEL**
+**Module : Arthur BARADEL — KUBERNETES**
+**Date : 11 Mai 2026**
+
+---
+
+## Pré-requis — Image backend v3.0
+
+### Contexte
+
+Le TP2 instrumentait le backend avec Postgres et une `DATABASE_URL`. Pour le TP3, le backend doit exposer des métriques Prometheus via un endpoint `/metrics`, afin d'être scrapé par la stack de monitoring.
+
+### Modifications apportées
+
+**`backend/requirements.txt`** — Ajout de `prometheus-client` :
+
+```
+flask==3.0.3
+psycopg2-binary==2.9.9
+prometheus-client==0.20.0
+```
+
+**`backend/app.py`** — Ajout de l'instrumentation :
+- `Counter` `guestbook_messages_total` : incrémenté à chaque POST réussi
+- `Histogram` `guestbook_request_seconds` : chronométre chaque requête par endpoint via `@app.before_request` / `@app.after_request`
+- Route `/metrics` qui sert les métriques au format Prometheus
+
+### Build et push
+
+```powershell
+$env:DOCKERHUB_USER = "mdprogra"
+
+docker buildx build --platform linux/amd64,linux/arm64 `
+  -t docker.io/$env:DOCKERHUB_USER/webapp-backend:v3.0 `
+  ./backend --push --no-cache
+```
+
+> **Note** : le cluster k3s est composé de nœuds hétérogènes (`godon-k3s-agent-1` en amd64, `godon-k3s-agent-2` en arm64). Une image buildée pour une seule architecture provoque une erreur `no match for platform in manifest` sur les nœuds de l'autre architecture. L'option `--platform linux/amd64,linux/arm64` de `docker buildx` est donc obligatoire pour produire une image multi-arch compatible avec l'ensemble du cluster.
+
+![Image webapp-backend:v3.0 publiée sur Docker Hub](../../Image/TP3/PreTP/00_docker_hub_v3.png)
+
+✅ **Pré-requis validé** : l'image `mdprogra/webapp-backend:v3.0` est publiée sur Docker Hub avec l'endpoint `/metrics` opérationnel.
+
+---
+
+## Bloc 1 — Helm
+
+### Objectif
+Packager l'intégralité de l'application en chart Helm pour remplacer les `kubectl apply` manuels par un déploiement paramétrable, versionné et rollbackable.
+
+### Étape 1.1 — Installation et premiers pas
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm version
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm repo update
+helm search repo redis
+```
+
+Un chart Helm est structuré en trois parties : `Chart.yaml` (métadonnées), `values.yaml` (paramètres par défaut), `templates/` (manifests YAML templatés avec le moteur Go). Helm est à Kubernetes ce que `apt` est à Debian — un gestionnaire de paquets.
+
+### Étape 1.2 — Installer un chart public
+
+Exercice d'échauffement sur Redis pour maîtriser le geste avant de créer notre propre chart :
+
+```bash
+kubectl create namespace helm-demo
+helm install demo-redis bitnami/redis \
+  --namespace helm-demo \
+  --set auth.password=demo123 \
+  --set master.persistence.size=200Mi \
+  --set replica.replicaCount=1
+helm list -n helm-demo
+kubectl get pod -n helm-demo
+helm uninstall demo-redis -n helm-demo
+kubectl delete namespace helm-demo
+```
+
+![helm search repo redis — charts Redis disponibles dans Bitnami](../../Image/TP3/Bloc1/01_helm_redis.png)
+
+### Étape 1.3 — Squelette et structure du chart
+
+```bash
+helm create webapp-chart
+```
+
+On vide les templates générés automatiquement et on reconstruit depuis les YAML du TP2. Structure finale :
+
+```
+webapp-chart/
+├── Chart.yaml
+├── values.yaml
+├── values-dev.yaml
+└── templates/
+    ├── _helpers.tpl
+    ├── configmap.yaml
+    ├── secret.yaml
+    ├── frontend-deployment.yaml
+    ├── frontend-service.yaml
+    ├── backend-deployment.yaml
+    ├── backend-service.yaml
+    ├── postgres-statefulset.yaml
+    ├── ingress.yaml
+    ├── servicemonitor.yaml
+    └── backend-hpa.yaml
+```
+
+**`Chart.yaml`** :
+
+```yaml
+apiVersion: v2
+name: webapp-chart
+description: Livre d'or k8s — chart Helm pédagogique
+type: application
+version: 0.1.0
+appVersion: "3.0"
+```
+
+**`values.yaml`** :
+
+```yaml
+global:
+  registry: docker.io/mdprogra
+  imagePullPolicy: IfNotPresent
+
+frontend:
+  image: webapp-frontend
+  tag: v1.2
+  replicas: 2
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { cpu: 200m, memory: 128Mi }
+
+backend:
+  image: webapp-backend
+  tag: v3.0
+  replicas: 2
+  appEnv: production
+  welcomeMessage: "Bienvenue !"
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { cpu: 200m, memory: 256Mi }
+
+postgres:
+  enabled: true
+  image: postgres:16-alpine
+  storageSize: 1Gi
+  user: guestbook
+  password: ChangeMe_inTP3!
+  database: guestbook
+
+ingress:
+  enabled: true
+  host: guestbook.labo.local
+  tls:
+    enabled: true
+    secretName: guestbook-tls
+```
+
+**`values-dev.yaml`** (override pour l'env de dev) :
+
+```yaml
+backend:
+  replicas: 1
+  appEnv: dev
+frontend:
+  replicas: 1
+ingress:
+  host: dev.guestbook.labo.local
+  tls:
+    enabled: false
+```
+
+**`templates/_helpers.tpl`** — fonctions réutilisables :
+
+```yaml
+{{- define "webapp.backendImage" -}}
+{{ .Values.global.registry }}/{{ .Values.backend.image }}:{{ .Values.backend.tag }}
+{{- end }}
+
+{{- define "webapp.frontendImage" -}}
+{{ .Values.global.registry }}/{{ .Values.frontend.image }}:{{ .Values.frontend.tag }}
+{{- end }}
+```
+
+**`templates/backend-deployment.yaml`** (extrait) :
+
+```yaml
+spec:
+  replicas: {{ .Values.backend.replicas }}
+  template:
+    spec:
+      containers:
+      - name: backend
+        image: {{ include "webapp.backendImage" . }}
+        {{- if .Values.postgres.enabled }}
+        - name: DATABASE_URL
+          value: "postgresql://$(DB_USER):$(DB_PASS)@postgres-0.postgres-svc:5432/$(DB_NAME)"
+        {{- end }}
+        resources:
+          {{- toYaml .Values.backend.resources | nindent 10 }}
+```
+
+### Étape 1.4 — Lint, template, install, upgrade, rollback
+
+```bash
+# Vérification statique
+helm lint webapp-chart
+
+# Rendu sans déploiement
+helm template webapp-chart --values webapp-chart/values-dev.yaml | less
+
+# Installation complète
+helm install gb webapp-chart \
+  --namespace guestbook --create-namespace \
+  --values webapp-chart/values-dev.yaml
+helm list -n guestbook
+helm get values gb -n guestbook
+```
+
+![helm install gb — release installée, tous les pods Running](../../Image/TP3/Bloc1/02_helm_install.png)
+
+```bash
+# Modifier replicas dans values, puis upgrade
+helm upgrade gb webapp-chart -n guestbook --values webapp-chart/values-dev.yaml
+helm history gb -n guestbook
+
+# Rollback à la révision 1
+helm rollback gb 1 -n guestbook
+```
+
+![helm history gb — historique des révisions avec install, upgrade et rollback](../../Image/TP3/Bloc1/03_helm_history.png)
+
+> **Piège rencontré** : `nindent` et `indent` sont distincts — `nindent` ajoute un saut de ligne avant le bloc indenté, ce qui est nécessaire quand on insère un bloc YAML sous une clé. L'oubli provoque une erreur de parsing silencieuse détectée uniquement via `helm template --debug`.
+
+> **Piège rencontré** : tenter un second `helm install` sur le même `release name` retourne `cannot re-use a name that is still in use`. Il faut soit `helm upgrade`, soit `helm uninstall` préalablement.
+
+✅ **Checkpoint 1** : `helm install gb` déploie l'application complète en une commande. `values-dev.yaml` produit une configuration différente de `values.yaml`. `helm rollback` ramène à la révision précédente.
+
+---
+
+## Bloc 2 — Monitoring : Prometheus + Grafana
+
+### Objectif
+Mettre en place la stack `kube-prometheus-stack`, instrumenter le backend avec des métriques custom, et créer un dashboard Grafana qui visualise l'activité du livre d'or.
+
+### Étape 2.1 — Installer kube-prometheus-stack
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+kubectl create namespace monitoring
+
+helm install kps prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  --set grafana.adminPassword=admin \
+  --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
+  --set alertmanager.enabled=false \
+  --set prometheus.prometheusSpec.resources.requests.memory=400Mi
+
+kubectl get pods -n monitoring
+kubectl get svc -n monitoring
+```
+
+L'option `serviceMonitorSelectorNilUsesHelmValues=false` est cruciale : sans elle, Prometheus n'écoute que les ServiceMonitors portant son propre label de release et ignore tous ceux que nous allons créer dans `guestbook`.
+
+![kube-prometheus-stack — pods monitoring en Running](../../Image/TP3/Bloc2/04_kps_pods.png)
+
+### Étape 2.2 — Accès à Grafana et Prometheus
+
+```bash
+kubectl port-forward -n monitoring svc/kps-grafana 3000:80 --address 0.0.0.0 &
+kubectl port-forward -n monitoring svc/kps-kube-prometheus-stack-prometheus 9090:9090 --address 0.0.0.0 &
+```
+
+Accès depuis le poste local via tunnel SSH :
+
+```bash
+ssh -N -L 3000:localhost:3000 -L 9090:localhost:9090 ubuntu@212.47.230.56
+```
+
+- Grafana : `http://localhost:3000` — login `admin` / `admin`
+- Prometheus : `http://localhost:9090`
+
+![Dashboard Grafana — Kubernetes / Compute Resources / Cluster](../../Image/TP3/Bloc2/05_grafana_dashboard.png)
+
+### Étape 2.3 — ServiceMonitor et vérification du scraping
+
+Ajout de `templates/servicemonitor.yaml` dans le chart. Le label `release: kps` est obligatoire pour que le Prometheus de kube-prometheus-stack accepte ce ServiceMonitor :
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: backend-metrics
+  labels:
+    release: kps
+spec:
+  selector:
+    matchLabels:
+      app: webapp
+      tier: back
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 15s
+  namespaceSelector:
+    matchNames:
+    - guestbook
+```
+
+Le port du Service backend doit être **nommé** (`name: http`) pour que la spec ServiceMonitor puisse le référencer, et les labels `app: webapp` / `tier: back` doivent être présents sur le Service :
+
+```yaml
+# Dans backend-service.yaml
+metadata:
+  labels:
+    app: webapp
+    tier: back
+ports:
+- port: 5000
+  targetPort: 5000
+  name: http
+```
+
+```bash
+helm upgrade gb webapp-chart -n guestbook --values webapp-chart/values.yaml
+kubectl get servicemonitor -n guestbook
+
+# Vérification de l'endpoint /metrics
+kubectl exec -n guestbook deploy/backend -- python3 -c \
+  "import urllib.request; print(urllib.request.urlopen('http://localhost:5000/metrics').read().decode())" | head -20
+```
+
+![Prometheus Targets — serviceMonitor/guestbook/backend-metrics/0 en UP](../../Image/TP3/Bloc2/06_prometheus_target.png)
+
+### Étape 2.4 — Requêtes PromQL et dashboard custom
+
+Requêtes testées dans l'UI Prometheus :
+
+```promql
+guestbook_messages_total
+rate(guestbook_request_seconds_count[1m])
+histogram_quantile(0.95, sum(rate(guestbook_request_seconds_bucket[5m])) by (le, endpoint))
+```
+
+Dashboard Grafana créé avec trois panels :
+- **Panel 1** — `guestbook_messages_total` : Time series, nombre cumulé de messages postés
+- **Panel 2** — `rate(guestbook_request_seconds_count[1m])` : Time series par endpoint, trafic en temps réel
+- **Panel 3** — `histogram_quantile(0.95, ...)` : p95 de latence par endpoint
+
+![Dashboard Grafana custom — métriques du livre d'or en temps réel](../../Image/TP3/Bloc2/07_grafana_custom.png)
+
+> **Piège rencontré** : le ServiceMonitor était bien créé mais Prometheus ne le détectait pas. Deux causes combinées : le label `release: kps` était absent, et les labels `app: webapp` / `tier: back` n'étaient pas présents sur le Service backend (Helm ne les injecte pas automatiquement). Vérifiable via `kubectl describe servicemonitor backend-metrics` et Prometheus UI → Status → Targets.
+
+✅ **Checkpoint 2** : Prometheus scrape le backend (`UP` dans Targets). Métrique `guestbook_messages_total` interrogeable. Dashboard Grafana custom opérationnel avec les 3 panels.
+
+---
+
+## Bloc 3 — HorizontalPodAutoscaler
+
+### Objectif
+Configurer un HPA sur le Deployment backend pour qu'il scale automatiquement entre 2 et 8 réplicas selon l'utilisation CPU, et le valider sous charge artificielle.
+
+### Étape 3.1 — Vérification de metrics-server
+
+k3s embarque `metrics-server` par défaut :
+
+```bash
+kubectl top nodes
+kubectl top pods -n guestbook
+```
+
+![kubectl top — consommation CPU/RAM des pods](../../Image/TP3/Bloc3/08_kubectl_top.png)
+
+### Étape 3.2 — HPA sur CPU
+
+Ajout de `templates/backend-hpa.yaml` dans le chart :
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 30
+```
+
+Le HPA nécessite que le Deployment ait des `resources.requests.cpu` définis — sans quoi il affiche `<unknown>/60%` et ne scale jamais.
+
+```bash
+helm upgrade gb webapp-chart -n guestbook --values webapp-chart/values.yaml
+kubectl get hpa -n guestbook
+kubectl describe hpa backend-hpa -n guestbook
+```
+
+![HPA créé — 2/2 réplicas, CPU cible à 60%](../../Image/TP3/Bloc3/09_hpa_initial.png)
+
+### Étape 3.3 — Test de charge
+
+L'image `williamyeh/hey` n'étant pas compatible arm64, on utilise un Job Python natif :
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: load-test
+  namespace: guestbook
+spec:
+  parallelism: 5
+  completions: 5
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: load
+        image: python:3.12-alpine
+        command: ["python3", "-c"]
+        args:
+          - |
+            import urllib.request, threading, time
+            def worker():
+                end = time.time() + 300
+                while time.time() < end:
+                    try:
+                        urllib.request.urlopen('http://backend-svc:5000/api/messages', timeout=2)
+                    except:
+                        pass
+            threads = [threading.Thread(target=worker) for _ in range(50)]
+            [t.start() for t in threads]
+            [t.join() for t in threads]
+```
+
+```bash
+kubectl apply -f load-test.yaml
+```
+
+Observation en temps réel dans deux terminaux séparés :
+
+```bash
+# Terminal 1
+watch -n2 kubectl get hpa,deploy,pod -n guestbook
+
+# Terminal 2
+kubectl top pods -n guestbook
+```
+
+Séquence observée :
+1. CPU backend monte au-dessus de 60%
+2. HPA déclenche le scale-up : 2 → 4 → 8 réplicas
+3. Sur Grafana, `rate(guestbook_request_seconds_count[1m])` explose
+4. Après suppression du Job, la charge chute
+5. Après 60s de stabilisation, scale-down à 2 réplicas
+
+```bash
+kubectl delete job load-test -n guestbook
+```
+
+![HPA scale-up sous charge — 8 réplicas actifs, CPU à 235%](../../Image/TP3/Bloc3/10_hpa_scaleup.png)
+
+![Grafana — pic de trafic corrélé au scale-up HPA](../../Image/TP3/Bloc3/11_grafana_charge.png)
+
+![HPA scale-down après charge — retour à 2 réplicas](../../Image/TP3/Bloc3/12_hpa_scaledown.png)
+
+> **Piège rencontré** : le HPA affichait `<unknown>/60%` au démarrage. Cause : les `resources.requests.cpu` n'étaient pas définis dans le template backend du chart. Ajouté dans `values.yaml` sous `backend.resources.requests.cpu: 50m`, puis `helm upgrade`.
+
+> **Piège rencontré** : l'image `williamyeh/hey` utilisée comme générateur de charge n'est pas compatible arm64. Remplacée par un Job Python utilisant `urllib.request` et `threading`, disponible nativement sur toutes les architectures.
+
+✅ **Checkpoint 3** : HPA passe le backend de 2 à 8 réplicas sous charge, visible dans `kubectl get hpa` et Grafana. Retour à 2 réplicas après la fenêtre de stabilisation de 60s.
+
+---
+
+## Bloc 4 — Pipeline CI/CD
+
+### Objectif
+Automatiser le cycle build → test → deploy via un pipeline GitHub Actions, de sorte qu'un `git push` sur `master` déclenche automatiquement un `helm upgrade` sur le cluster.
+
+### Étape 4.1 — Architecture
+
+```
+[git push]
+    │
+    ├─ build-backend  : docker buildx build & push (multi-arch amd64+arm64)
+    ├─ build-frontend : docker buildx build & push (multi-arch amd64+arm64)
+    ├─ helm-lint      : helm lint + helm template
+    └─ deploy         : helm upgrade --install → cluster k3s
+```
+
+### Étape 4.2 — ServiceAccount dédié CI
+
+Pour ne pas injecter un kubeconfig admin dans la CI, on crée un ServiceAccount `ci-deployer` limité au namespace `guestbook` :
+
+```bash
+kubectl apply -f ci-rbac.yaml
+TOKEN=$(kubectl get secret ci-deployer-token -n guestbook -o jsonpath='{.data.token}' | base64 -d)
+CA=$(kubectl get secret ci-deployer-token -n guestbook -o jsonpath='{.data.ca\.crt}')
+```
+
+Construction du kubeconfig CI avec l'IP publique du serveur et encodage :
+
+```bash
+cat > kubeconfig-ci.yaml <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+- name: k3s
+  cluster:
+    server: https://212.47.230.56:6443
+    certificate-authority-data: ${CA}
+users:
+- name: ci
+  user:
+    token: ${TOKEN}
+contexts:
+- name: ci@k3s
+  context:
+    cluster: k3s
+    user: ci
+    namespace: guestbook
+current-context: ci@k3s
+EOF
+
+base64 -w 0 kubeconfig-ci.yaml
+# → Copier dans GitHub Settings → Secrets and variables → Actions → KUBECONFIG_B64
+```
+
+![Secrets CI configurés dans GitHub Actions — KUBECONFIG_B64, DOCKERHUB_USER, DOCKERHUB_TOKEN](../../Image/TP3/Bloc4/13_gitlab_vars.png)
+
+### Étape 4.3 — Le `.github/workflows/deploy.yml`
+
+```yaml
+name: CI/CD
+
+on:
+  push:
+    branches: [ master ]
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_BACKEND: docker.io/${{ secrets.DOCKERHUB_USER }}/webapp-backend
+  IMAGE_FRONTEND: docker.io/${{ secrets.DOCKERHUB_USER }}/webapp-frontend
+
+jobs:
+  build-backend:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Login Docker Hub
+      run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USER }}" --password-stdin
+    - name: Build & push backend
+      run: |
+        docker buildx create --use
+        docker buildx build \
+          --platform linux/amd64,linux/arm64 \
+          -t ${{ env.IMAGE_BACKEND }}:${{ github.sha }} \
+          --push ./TP/webapp/backend
+
+  build-frontend:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Login Docker Hub
+      run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USER }}" --password-stdin
+    - name: Build & push frontend
+      run: |
+        docker buildx create --use
+        docker buildx build \
+          --platform linux/amd64,linux/arm64 \
+          -t ${{ env.IMAGE_FRONTEND }}:${{ github.sha }} \
+          --push ./TP/webapp/frontend
+
+  helm-lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Helm
+      run: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+    - name: Lint
+      run: |
+        helm lint TP/webapp-chart
+        helm template TP/webapp-chart --values TP/webapp-chart/values.yaml > /tmp/rendered.yaml
+        wc -l /tmp/rendered.yaml
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [build-backend, build-frontend, helm-lint]
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Helm
+      run: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+    - name: Setup kubeconfig
+      run: |
+        mkdir -p ~/.kube
+        echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > ~/.kube/config
+        chmod 600 ~/.kube/config
+    - name: Deploy
+      run: |
+        helm upgrade --install gb TP/webapp-chart \
+          --namespace guestbook \
+          --values TP/webapp-chart/values.yaml \
+          --set global.registry=docker.io/${{ secrets.DOCKERHUB_USER }} \
+          --set backend.tag=${{ github.sha }} \
+          --set frontend.tag=${{ github.sha }} \
+          --wait --timeout 5m
+```
+
+### Étape 4.4 — Démonstration du pipeline
+
+On modifie le message de bienvenue dans `backend/app.py` et on pousse sur `master`. Séquence observée dans GitHub Actions :
+
+1. `build-backend` → image taguée avec le SHA du commit, poussée sur Docker Hub (multi-arch)
+2. `helm-lint` → succès
+3. `deploy` → `helm upgrade`, rollout OK, livre d'or accessible avec la nouvelle image
+
+```bash
+# Vérification post-déploiement
+kubectl get pods -n guestbook
+kubectl describe deploy/backend -n guestbook | grep Image
+```
+
+![Pipeline GitHub Actions — 4 jobs verts sur push](../../Image/TP3/Bloc4/14_pipeline_vert.png)
+
+![Docker Hub — image taguée avec le SHA du commit](../../Image/TP3/Bloc4/15_dockerhub_sha.png)
+
+![Livre d'or — nouvelle version déployée automatiquement](../../Image/TP3/Bloc4/16_app_deployee.png)
+
+> **Piège rencontré** : `helm upgrade` échouait avec `Kubernetes cluster unreachable: https://127.0.0.1:6443`. Le kubeconfig généré automatiquement via `kubectl config view` contenait `127.0.0.1` au lieu de l'IP publique. Solution : construire le kubeconfig manuellement avec `server: https://212.47.230.56:6443`.
+
+> **Bonne pratique** : ne jamais utiliser le mot de passe Docker Hub directement — utiliser un **PAT (Personal Access Token)** révocable créé sur hub.docker.com. Les secrets CI (`KUBECONFIG_B64`, `DOCKERHUB_TOKEN`) doivent être **masked** ET **protected** dans GitHub Actions.
+
+✅ **Checkpoint 4** : Pipeline GitHub Actions vert sur push. Image avec SHA visible sur Docker Hub. Application redéployée automatiquement, vérifiable via le navigateur.
+
+---
+
+## Synthèse des commandes TP3
+
+| Commande | Description |
+|---|---|
+| `helm repo add <nom> <url>` | Ajouter un dépôt de charts |
+| `helm search repo <terme>` | Chercher un chart dans les dépôts |
+| `helm install <release> <chart> --values <file>` | Installer une release |
+| `helm upgrade <release> <chart> -n <ns>` | Mettre à jour une release |
+| `helm rollback <release> <revision> -n <ns>` | Revenir à une révision |
+| `helm history <release> -n <ns>` | Historique des révisions |
+| `helm lint <chart>` | Vérification statique du chart |
+| `helm template <chart> --values <file>` | Rendu sans déploiement |
+| `helm uninstall <release> -n <ns>` | Supprimer une release |
+| `kubectl top nodes` | Consommation CPU/RAM des nœuds |
+| `kubectl top pods -n <ns>` | Consommation CPU/RAM des pods |
+| `kubectl get hpa -n <ns>` | État de l'autoscaler |
+| `kubectl describe hpa <nom> -n <ns>` | Détails et events du HPA |
+
+---
+
+## Pièges rencontrés — TP3
+
+| Symptôme | Cause | Résolution |
+|---|---|---|
+| `cannot re-use a name that is still in use` | `helm install` sur une release existante | Utiliser `helm upgrade` ou `helm uninstall` d'abord |
+| Templates Helm cassés silencieusement | `nindent` vs `indent`, quotes oubliées | `helm template --debug` pour voir l'erreur exacte |
+| Prometheus n'a pas le target backend | Label `release: kps` absent du ServiceMonitor | Ajouter `release: kps` dans les labels du ServiceMonitor |
+| ServiceMonitor ignoré | Port du Service non nommé ou labels manquants sur le Service | Ajouter `name: http` sur le port et les labels `app/tier` sur le Service |
+| HPA bloqué à `<unknown>/60%` | `resources.requests.cpu` absent du Deployment | Définir `requests.cpu` dans `values.yaml` |
+| `ErrImagePull` — `no match for platform in manifest` | Cluster multi-arch (amd64 + arm64) — image buildée pour une seule plateforme | Utiliser `docker buildx build --platform linux/amd64,linux/arm64 --push` |
+| Job de charge sans effet (image incompatible arm64) | `williamyeh/hey` non disponible sur arm64 | Remplacer par un Job Python avec `urllib.request` et `threading` |
+| Pipeline `kubectl: connection refused` sur `127.0.0.1` | Kubeconfig généré avec l'IP locale au lieu de l'IP publique | Construire le kubeconfig manuellement avec `server: https://212.47.230.56:6443` |
+| `helm upgrade` timeout en CI | Readiness probe trop serrée, Postgres lent | Augmenter `initialDelaySeconds`, `--timeout 5m` |
+| `docker push` denied en CI | Mauvais PAT Docker Hub ou `DOCKERHUB_USER` incorrect | Vérifier les secrets GitHub Actions, utiliser un PAT révocable |

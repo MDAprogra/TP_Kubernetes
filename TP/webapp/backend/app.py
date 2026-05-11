@@ -1,7 +1,8 @@
-from flask import Flask, jsonify, request
-import os, socket, datetime
+from flask import Flask, jsonify, request, Response
+import os, socket, datetime, time
 import psycopg2
 from psycopg2 import pool
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 app = Flask(__name__)
 
@@ -9,6 +10,28 @@ DB_URL = os.environ.get("DATABASE_URL")
 DB_POOL = None
 MEM_MESSAGES = []
 
+# --- Métriques Prometheus ---
+MESSAGES_TOTAL = Counter(
+    "guestbook_messages_total",
+    "Nombre total de messages postés"
+)
+REQUEST_LATENCY = Histogram(
+    "guestbook_request_seconds",
+    "Latence des requêtes",
+    ["endpoint"]
+)
+
+@app.before_request
+def _start_timer():
+    request._start = time.time()
+
+@app.after_request
+def _record_latency(resp):
+    elapsed = time.time() - getattr(request, "_start", time.time())
+    REQUEST_LATENCY.labels(endpoint=request.path).observe(elapsed)
+    return resp
+
+# --- DB ---
 def init_db():
     global DB_POOL
     if not DB_URL:
@@ -36,6 +59,7 @@ def messages():
                     text = request.get_json(force=True).get("text", "")
                     cur.execute("INSERT INTO messages(text) VALUES (%s)", (text,))
                     conn.commit()
+                    MESSAGES_TOTAL.inc()          # ← compteur incrémenté
                 cur.execute("SELECT text FROM messages ORDER BY id")
                 msgs = [r[0] for r in cur.fetchall()]
         finally:
@@ -43,6 +67,7 @@ def messages():
     else:
         if request.method == "POST":
             MEM_MESSAGES.append(request.get_json(force=True).get("text", ""))
+            MESSAGES_TOTAL.inc()                  # ← aussi en mode mémoire
         msgs = MEM_MESSAGES
 
     return jsonify({
@@ -57,6 +82,10 @@ def messages():
 @app.route("/api/health")
 def health():
     return jsonify({"status": "ok"}), 200
+
+@app.route("/metrics")
+def metrics():
+    return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
 
 if __name__ == "__main__":
     init_db()
