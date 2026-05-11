@@ -4,8 +4,10 @@ on:
   push:
     branches: [ master ]
 
+permissions:
+  contents: read
+
 env:
-  REGISTRY: docker.io
   IMAGE_BACKEND: docker.io/${{ secrets.DOCKERHUB_USER }}/webapp-backend
   IMAGE_FRONTEND: docker.io/${{ secrets.DOCKERHUB_USER }}/webapp-frontend
 
@@ -42,9 +44,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - name: Helm lint
-      uses: azure/setup-helm@v3
-    - run: |
+    - name: Install Helm
+      run: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+    - name: Lint
+      run: |
         helm lint webapp-chart
         helm template webapp-chart --values webapp-chart/values.yaml > /tmp/rendered.yaml
         wc -l /tmp/rendered.yaml
@@ -54,7 +57,8 @@ jobs:
     needs: [build-backend, build-frontend, helm-lint]
     steps:
     - uses: actions/checkout@v4
-    - uses: azure/setup-helm@v3
+    - name: Install Helm
+      run: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
     - name: Setup kubeconfig
       run: |
         mkdir -p ~/.kube
