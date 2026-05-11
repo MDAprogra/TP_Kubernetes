@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webapp-config
+data:
+  APP_ENV: {{ .Values.backend.appEnv | quote }}
+  WELCOME_MESSAGE: {{ .Values.backend.welcomeMessage | quote }}
+  LOG_LEVEL: "info"

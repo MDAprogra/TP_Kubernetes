@@ -1,0 +1,36 @@
+global:
+  registry: docker.io/mdprogra
+  imagePullPolicy: IfNotPresent
+
+frontend:
+  image: webapp-frontend
+  tag: v1.0
+  replicas: 2
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { cpu: 200m, memory: 128Mi }
+
+backend:
+  image: webapp-backend
+  tag: v3.0
+  replicas: 2
+  appEnv: production
+  welcomeMessage: "Bienvenue !"
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { cpu: 200m, memory: 256Mi }
+
+postgres:
+  enabled: true
+  image: postgres:16-alpine
+  storageSize: 1Gi
+  user: guestbook
+  password: ChangeMe_inTP3!
+  database: guestbook
+
+ingress:
+  enabled: true
+  host: guestbook.labo.local
+  tls:
+    enabled: false
+    secretName: guestbook-tls

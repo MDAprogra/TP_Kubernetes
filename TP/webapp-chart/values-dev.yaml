@@ -1,0 +1,7 @@
+backend:
+  replicas: 1
+  appEnv: dev
+frontend:
+  replicas: 1
+ingress:
+  host: dev.guestbook.labo.local

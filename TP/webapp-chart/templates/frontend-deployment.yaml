@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  labels:
+    app: webapp
+    tier: front
+spec:
+  replicas: {{ .Values.frontend.replicas }}
+  selector:
+    matchLabels:
+      app: webapp
+      tier: front
+  template:
+    metadata:
+      labels:
+        app: webapp
+        tier: front
+    spec:
+      containers:
+      - name: frontend
+        image: {{ include "webapp.frontendImage" . }}
+        imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+        ports:
+        - containerPort: 80
+        resources:
+          {{- toYaml .Values.frontend.resources | nindent 10 }}

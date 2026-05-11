@@ -1,0 +1,6 @@
+apiVersion: v2
+name: webapp-chart
+description: Livre d'or k8s — chart Helm pédagogique
+type: application
+version: 0.1.0
+appVersion: "3.0"

@@ -24,7 +24,7 @@ jobs:
         docker buildx build \
           --platform linux/amd64,linux/arm64 \
           -t ${{ env.IMAGE_BACKEND }}:${{ github.sha }} \
-          --push ./backend
+          --push ./TP/webapp/backend
 
   build-frontend:
     runs-on: ubuntu-latest
@@ -38,7 +38,7 @@ jobs:
         docker buildx build \
           --platform linux/amd64,linux/arm64 \
           -t ${{ env.IMAGE_FRONTEND }}:${{ github.sha }} \
-          --push ./frontend
+          --push ./TP/webapp/frontend
 
   helm-lint:
     runs-on: ubuntu-latest
@@ -48,8 +48,8 @@ jobs:
       run: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
     - name: Lint
       run: |
-        helm lint webapp-chart
-        helm template webapp-chart --values webapp-chart/values.yaml > /tmp/rendered.yaml
+        helm lint TP/webapp-chart
+        helm template TP/webapp-chart --values TP/webapp-chart/values.yaml > /tmp/rendered.yaml
         wc -l /tmp/rendered.yaml
 
   deploy:
@@ -66,9 +66,9 @@ jobs:
         chmod 600 ~/.kube/config
     - name: Deploy
       run: |
-        helm upgrade --install gb webapp-chart \
+        helm upgrade --install gb TP/webapp-chart \
           --namespace guestbook \
-          --values webapp-chart/values.yaml \
+          --values TP/webapp-chart/values.yaml \
           --set global.registry=docker.io/${{ secrets.DOCKERHUB_USER }} \
           --set backend.tag=${{ github.sha }} \
           --set frontend.tag=${{ github.sha }} \
