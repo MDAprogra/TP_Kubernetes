@@ -2559,7 +2559,7 @@ kubectl get certificate -n guestbook -w
 
 Le `Certificate` est passé de `Issuing` à `Ready` en **26 secondes**.
 
-![Certificate Ready — cert-manager a obtenu le certificat Let's Encrypt](../../Image/TP4/Bloc6/08_certificate_ready.png.png)
+![Certificate Ready — cert-manager a obtenu le certificat Let's Encrypt](../../Image/TP4/Bloc6/08_certificate_ready.png)
 
 ![Livre d'or accessible en HTTPS — cadenas vert valide dans le navigateur](../../Image/TP4/Bloc6/09_https_browser.png)
 
