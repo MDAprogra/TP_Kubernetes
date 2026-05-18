@@ -2212,3 +2212,728 @@ kubectl describe deploy/backend -n guestbook | grep Image
 | Pipeline `kubectl: connection refused` sur `127.0.0.1` | Kubeconfig généré avec l'IP locale au lieu de l'IP publique | Construire le kubeconfig manuellement avec `server: https://212.47.230.56:6443` |
 | `helm upgrade` timeout en CI | Readiness probe trop serrée, Postgres lent | Augmenter `initialDelaySeconds`, `--timeout 5m` |
 | `docker push` denied en CI | Mauvais PAT Docker Hub ou `DOCKERHUB_USER` incorrect | Vérifier les secrets GitHub Actions, utiliser un PAT révocable |
+
+---
+---
+
+# Compte Rendu — TP4 Kubernetes
+**Binôme : Corentin GODON & Matthias DAUVEL**
+**Module : Arthur BARADEL — KUBERNETES**
+**Date : 18 Mai 2026**
+
+---
+
+## Bloc 1 — Setup Scaleway
+
+### Objectif
+Configurer l'environnement Scaleway : création du projet, génération d'une clé API IAM, installation et configuration de la CLI `scw`.
+
+### Étape 1.1 — Compte et projet
+
+Sur la console Scaleway :
+1. Création du compte (carte bancaire requise).
+2. `Organization → Projects` : création du projet `tp4-k8s-dauvel`.
+3. `IAM → API Keys` : création d'une clé API liée au projet. Access Key et Secret Key notées (Secret Key affichée une seule fois).
+
+### Étape 1.2 — CLI Scaleway
+
+```bash
+# Installation Linux
+curl -fsSL https://raw.githubusercontent.com/scaleway/scaleway-cli/master/scripts/get.sh | sh
+
+scw init
+# Région : fr-par, Zone : fr-par-1, clés API saisies, project ID renseigné
+scw info
+```
+
+La commande `scw info` retourne l'organisation et le projet configurés, confirmant que la CLI est correctement authentifiée.
+
+![scw info — organisation et projet attendus confirmés](../../Image/TP4/Bloc1/01_scw_info.png)
+
+✅ **Checkpoint 1** : `scw info` affiche l'organisation et le projet `tp4-k8s-dauvel` attendus.
+
+---
+
+## Bloc 2 — Création du cluster Kapsule multi-AZ
+
+### Objectif
+Provisionner un cluster Kubernetes managé Kapsule multi-AZ avec deux pools de nœuds dans deux zones de disponibilité différentes (`fr-par-1` et `fr-par-2`).
+
+### Étape 2.1 — Lister les options disponibles
+
+```bash
+scw k8s version list region=fr-par
+scw instance server-type list zone=fr-par-1 | grep -E "DEV1|GP1"
+```
+
+Le type `DEV1-M` (3 vCPU, 4 Go RAM, ~0,02 €/h) est sélectionné comme instance la moins chère éligible.
+
+### Étape 2.2 — Création multi-AZ
+
+Un seul cluster avec un seul control plane, deux pools dans deux AZ différentes :
+
+```bash
+scw k8s cluster create \
+  name=tp4-cluster-dauvel \
+  type=kapsule \
+  version=1.32.13 \
+  cni=cilium \
+  pools.0.name=pool-paris-1 \
+  pools.0.node-type=DEV1-M \
+  pools.0.size=2 \
+  pools.0.zone=fr-par-1 \
+  pools.0.autohealing=true \
+  pools.1.name=pool-paris-2 \
+  pools.1.node-type=DEV1-M \
+  pools.1.size=1 \
+  pools.1.zone=fr-par-2 \
+  pools.1.autohealing=true \
+  region=fr-par
+
+export CLUSTER_ID=<id-retourné>
+scw k8s cluster wait $CLUSTER_ID region=fr-par
+```
+
+### Étape 2.3 — Kubeconfig
+
+```bash
+scw k8s kubeconfig install $CLUSTER_ID region=fr-par
+kubectl config use-context <le-contexte-kapsule>
+kubectl get nodes -o wide --show-labels | grep topology.kubernetes.io/zone
+```
+
+Chaque nœud porte le label `topology.kubernetes.io/zone=fr-par-1` ou `fr-par-2`, confirmant la répartition multi-AZ.
+
+![kubectl get nodes — 3 nœuds Ready répartis sur 2 AZ](../../Image/TP4/Bloc2/02_cluster_nodes.png)
+
+✅ **Checkpoint 2** : 3 nœuds `Ready`, répartis sur `fr-par-1` (2 nœuds) et `fr-par-2` (1 nœud).
+
+---
+
+## Bloc 3 — Premier contact et exploration
+
+### Objectif
+Explorer le cluster Kapsule pour identifier les différences structurelles avec le cluster k3s du TP1, et documenter les observations dans `notes-exploration.md`.
+
+### Étape 3.1 — Exploration des composants
+
+```bash
+kubectl get nodes -o wide
+kubectl get pods -A
+kubectl get sc
+kubectl cluster-info
+kubectl get pods -A | grep -E "apiserver|etcd|scheduler"
+```
+
+La dernière commande ne retourne aucun résultat — le control plane est invisible, géré par Scaleway.
+
+![Pods système Kapsule — konnectivity-agent, csi-node, hubble visibles](../../Image/TP4/Bloc3/03_pods_system.png)
+
+![StorageClasses Kapsule — 8 classes basées sur csi.scaleway.com](../../Image/TP4/Bloc3/04_storage_class.png)
+
+### Différences observées (notes-exploration.md)
+
+**1. Control plane invisible**
+Sur k3s : `kube-apiserver`, `etcd`, `kube-scheduler`, `kube-controller-manager` tournent sur le nœud server et sont visibles via `kubectl get pods -A`. Sur Kapsule : aucun de ces pods n'est visible — ils sont gérés par Scaleway, accessibles uniquement via l'URL `https://cd95bb1a...api.k8s.fr-par.scw.cloud:6443`.
+
+**2. Pas d'IngressController pré-installé**
+Sur k3s : Traefik est installé par défaut. Sur Kapsule : aucun IngressController — il faut installer ingress-nginx manuellement via Helm.
+
+**3. StorageClasses multiples**
+Sur k3s : 1 seule StorageClass `local-path` (stockage local sur le nœud). Sur Kapsule : 8 StorageClasses basées sur `csi.scaleway.com` (`scw-bssd`, `sbs-default`, `sbs-5k`, `sbs-15k`, avec variantes `-retain`).
+
+**4. CNI différent**
+Sur k3s : Flannel + kube-router. Sur Kapsule : Cilium (avec Hubble pour l'observabilité réseau).
+
+**5. Pods système spécifiques à Kapsule**
+- `konnectivity-agent` : tunnel sécurisé entre control plane Scaleway et nœuds
+- `csi-node` : driver Block Storage natif Scaleway
+- `hubble-generate-certs` : certificats pour l'observabilité Cilium
+
+Sur k3s : aucun de ces composants.
+
+**6. metrics-server pré-installé**
+Sur Kapsule comme sur k3s : `metrics-server` est présent par défaut.
+
+✅ **Checkpoint 3** : 6 différences observables identifiées entre Kapsule et k3s.
+
+---
+
+## Bloc 4 — Container Registry Scaleway
+
+### Objectif
+Migrer les images Docker du livre d'or de Docker Hub vers le Container Registry Scaleway (SCR), et configurer l'authentification depuis le cluster via un `imagePullSecret`.
+
+### Étape 4.1 — Namespace SCR
+
+```bash
+scw registry namespace create \
+  name=tp4-dauvel \
+  region=fr-par \
+  is-public=false
+
+export SCR_ENDPOINT=rg.fr-par.scw.cloud/tp4-dauvel
+```
+
+### Étape 4.2 — Push des images
+
+```bash
+echo "$SCW_SECRET_KEY" | docker login rg.fr-par.scw.cloud -u nologin --password-stdin
+
+docker tag docker.io/mdprogra/webapp-backend:v2.0 $SCR_ENDPOINT/webapp-backend:v2.0
+docker push $SCR_ENDPOINT/webapp-backend:v2.0
+
+docker tag docker.io/mdprogra/webapp-frontend:v1.2 $SCR_ENDPOINT/webapp-frontend:v1.2
+docker push $SCR_ENDPOINT/webapp-frontend:v1.2
+```
+
+### Étape 4.3 — imagePullSecret
+
+```bash
+kubectl create namespace guestbook
+kubectl config set-context --current --namespace=guestbook
+
+kubectl create secret docker-registry scw-registry-credentials \
+  --docker-server=rg.fr-par.scw.cloud \
+  --docker-username=nologin \
+  --docker-password=$SCW_SECRET_KEY
+```
+
+![Images visibles dans la console SCR — webapp-backend:v2.0 et webapp-frontend:v1.2](../../Image/TP4/Bloc4/05_scr_images.png)
+
+✅ **Checkpoint 4** : Images `webapp-backend:v2.0` et `webapp-frontend:v1.2` visibles dans la console SCR. Secret `scw-registry-credentials` créé dans le namespace `guestbook`.
+
+---
+
+## Bloc 5 — Migration du livre d'or
+
+### Objectif
+Adapter les manifests du TP2 pour le cluster Kapsule : nouvelles images SCR, `imagePullSecrets`, et StorageClass Block Storage `scw-bssd`.
+
+### Étape 5.1 — Adaptation des manifests
+
+Trois modifications appliquées aux manifests `tp4/manifests/` (copiés depuis le TP2) :
+
+**1.** Remplacement des images : `docker.io/mdprogra/...` → `rg.fr-par.scw.cloud/tp4-dauvel/...`
+
+**2.** Ajout dans chaque `spec.template.spec` des Deployments :
+```yaml
+imagePullSecrets:
+- name: scw-registry-credentials
+```
+
+**3.** Dans le StatefulSet Postgres, changement de la `storageClassName` :
+```yaml
+volumeClaimTemplates:
+- metadata:
+    name: data
+  spec:
+    accessModes: ["ReadWriteOnce"]
+    storageClassName: scw-bssd
+    resources:
+      requests:
+        storage: 5Gi
+```
+
+### Étape 5.2 — Déploiement
+
+```bash
+kubectl apply -f tp4/manifests/
+kubectl get pods,pvc,svc
+```
+
+![Tous les pods Running — PVC data-postgres-0 Bound sur scw-bssd](../../Image/TP4/Bloc5/06_pods_running.png)
+
+> **Piège rencontré** : le PVC `data-postgres-0` est resté en `Pending` pendant environ 90 secondes avant de passer en `Bound` — le provisionnement Block Storage prend du temps. Patience nécessaire avant de diagnostiquer un problème.
+
+✅ **Checkpoint 5** : Tous les pods en `Running`, PVC `data-postgres-0` en `Bound` sur `scw-bssd`.
+
+---
+
+## Bloc 6 — LoadBalancer + Ingress + cert-manager + Let's Encrypt
+
+### Objectif
+Exposer le livre d'or en HTTPS avec un certificat Let's Encrypt **valide** (impossible en TP2 sur k3s) grâce à un vrai Load Balancer Scaleway et un domaine DNS public.
+
+### Étape 6.1 — ingress-nginx via Helm
+
+```bash
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo update
+
+helm install ingress-nginx ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx --create-namespace \
+  --set controller.service.type=LoadBalancer
+
+kubectl get svc -n ingress-nginx ingress-nginx-controller -w
+# Attendre l'EXTERNAL-IP (1-2 min)
+```
+
+```bash
+export LB_IP=$(kubectl get svc -n ingress-nginx ingress-nginx-controller \
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+echo "Load Balancer IP : $LB_IP"
+# → 51.158.58.244
+```
+
+Le Cloud Controller Manager Scaleway provisionne automatiquement un **vrai Load Balancer** visible dans la console Scaleway → Load Balancers.
+
+![Load Balancer Scaleway provisionné automatiquement — IP 51.158.58.244](../../Image/TP4/Bloc6/07_lb_scaleway.png)
+
+### Étape 6.2 — DNS
+
+Enregistrement A `tp4.dauvel.mediaschool-rouen.fr → 51.158.58.244` créé chez le registrar.
+
+```bash
+dig +short tp4.dauvel.mediaschool-rouen.fr
+# → 51.158.58.244
+```
+
+### Étape 6.3 — cert-manager
+
+```bash
+helm repo add jetstack https://charts.jetstack.io
+helm repo update
+
+helm install cert-manager jetstack/cert-manager \
+  --namespace cert-manager --create-namespace \
+  --version v1.16.1 \
+  --set crds.enabled=true
+```
+
+### Étape 6.4 — ClusterIssuer + Ingress avec TLS
+
+**`60-clusterissuer.yaml`** :
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: corentingodon21@gmail.com
+    privateKeySecretRef:
+      name: letsencrypt-prod-key
+    solvers:
+    - http01:
+        ingress:
+          class: nginx
+```
+
+**`61-ingress.yaml`** :
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: webapp-ingress
+  namespace: guestbook
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - tp4.dauvel.mediaschool-rouen.fr
+    secretName: webapp-tls
+  rules:
+  - host: tp4.dauvel.mediaschool-rouen.fr
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-svc
+            port:
+              number: 80
+```
+
+```bash
+kubectl apply -f 60-clusterissuer.yaml
+kubectl apply -f 61-ingress.yaml
+kubectl get certificate -n guestbook -w
+```
+
+Le `Certificate` est passé de `Issuing` à `Ready` en **26 secondes**.
+
+![Certificate Ready — cert-manager a obtenu le certificat Let's Encrypt](../../Image/TP4/Bloc6/08_certificate_ready.png.png)
+
+![Livre d'or accessible en HTTPS — cadenas vert valide dans le navigateur](../../Image/TP4/Bloc6/09_https_browser.png)
+
+```bash
+curl https://tp4.dauvel.mediaschool-rouen.fr/
+# → 200 OK, certificat Let's Encrypt valide
+```
+
+> **Différence clé avec le TP2** : sur k3s, nous avions un certificat auto-signé car Traefik utilisait un ServiceLB (NodePort déguisé) sans IP publique stable. Let's Encrypt ne peut pas faire sa validation HTTP-01 sur un port non standard. Sur Kapsule, le vrai Load Balancer Scaleway avec une IP publique stable permet la validation HTTP-01 sur le port 80 standard — le certificat est obtenu en quelques secondes.
+
+✅ **Checkpoint 6** : Livre d'or accessible en HTTPS avec certificat Let's Encrypt valide. Cadenas vert sans avertissement dans le navigateur.
+
+---
+
+## Bloc 7 — Stockage persistant Block Storage
+
+### Objectif
+Inspecter la StorageClass `scw-bssd` et démontrer que le volume Block Storage suit le pod lors d'un replanification sur un autre nœud — contrairement à `local-path` sur k3s.
+
+### Étape 7.1 — Inspecter la StorageClass
+
+```bash
+kubectl get sc
+kubectl describe sc scw-bssd
+```
+
+Différence fondamentale entre `local-path` (k3s) et `scw-bssd` (Kapsule) :
+
+| Aspect | `local-path` (k3s) | `scw-bssd` (Kapsule) |
+|---|---|---|
+| Type | Fichier local sur le nœud | Volume distant réseau |
+| Si nœud disparaît | Données perdues | Volume rattachable à un autre nœud |
+| Multi-AZ | Coincé sur le nœud | Coincé sur l'AZ du volume |
+| Snapshots | Non | Oui |
+| Coût | 0 € | ~0,10 €/Go/mois |
+
+### Étape 7.2 — Démontrer la portabilité
+
+```bash
+kubectl get pod postgres-0 -o wide
+# → postgres-0 tourne sur pool-paris-1-abcd (fr-par-1)
+
+kubectl delete pod postgres-0 --force --grace-period=0
+kubectl get pod postgres-0 -w
+```
+
+Scaleway détache le Block Storage du nœud d'origine et le rattache au nouveau nœud où le pod est replanifié. Les données sont préservées.
+
+![PVC scw-bssd Bound — volume Block Storage provisionné par Scaleway](../../Image/TP4/Bloc7/10_pvc_bound.png)
+
+![Block Storage visible dans la console Scaleway](../../Image/TP4/Bloc7/11_block_storage_scaleway.png)
+
+![Pod postgres-0 replanifié avec données intactes](../../Image/TP4/Bloc7/12_pod_replanifie.png)
+
+> **Limite observée** : le Block Storage est lié à une AZ. Un volume provisionné dans `fr-par-2` ne peut pas être monté depuis un nœud `fr-par-1`. Si tous les nœuds d'une AZ tombent, le pod Postgres ne peut pas être replanifié dans l'autre AZ. Solutions production : réplication applicative (Patroni, Postgres logical replication).
+
+✅ **Checkpoint 7** : Pod `postgres-0` supprimé et replanifié sur un autre nœud avec son volume Block Storage rattaché automatiquement. Données préservées.
+
+---
+
+## Bloc 8 — Cluster Autoscaler en action
+
+### Objectif
+Activer l'autoscaling des nœuds sur le pool `pool-paris-1`, déclencher un scale-up via un workload gourmand en CPU, et observer le provisionnement automatique de nouveaux nœuds Scaleway.
+
+### Étape 8.1 — Activer l'autoscaling
+
+```bash
+scw k8s pool list cluster-id=$CLUSTER_ID region=fr-par
+export POOL_ID=<id-du-pool-paris-1>
+
+scw k8s pool update $POOL_ID region=fr-par \
+  autoscaling=true \
+  min-size=2 \
+  max-size=5
+```
+
+### Étape 8.2 — Déploiement de la charge (`80-greedy.yaml`)
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: greedy
+  namespace: guestbook
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: greedy }
+  template:
+    metadata:
+      labels: { app: greedy }
+    spec:
+      containers:
+      - name: stress
+        image: progrium/stress
+        args: ["--cpu", "2", "--timeout", "600s"]
+        resources:
+          requests: { cpu: "1500m", memory: "256Mi" }
+          limits:   { cpu: "2000m", memory: "512Mi" }
+```
+
+```bash
+kubectl apply -f 80-greedy.yaml
+kubectl scale deploy/greedy --replicas=10
+```
+
+### Étape 8.3 — Observer le scale-up
+
+Trois terminaux parallèles :
+
+```bash
+# Pods en attente
+watch -n2 'kubectl get pods -n guestbook -l app=greedy'
+
+# Nœuds qui apparaissent
+watch -n5 'kubectl get nodes'
+
+# Events autoscaler
+kubectl get events -n kube-system --field-selector source=cluster-autoscaler -w
+```
+
+Séquence observée :
+1. Pods en `Pending` avec `FailedScheduling` — ressources insuffisantes sur les 2 nœuds existants
+2. Le Cluster Autoscaler détecte les pods non planifiables et déclenche le scale-up en **moins de 30 secondes**
+3. 3 nouveaux nœuds DEV1-M provisionnés côté Scaleway dans `pool-paris-1` (`fr-par-1`)
+4. Nœuds passent en `Ready`, pods `greedy` schedulés
+5. Pool `pool-paris-1` passe de 2 à 5 nœuds (limite `max-size`)
+
+![Pods greedy en Pending — FailedScheduling déclenche le Cluster Autoscaler](../../Image/TP4/Bloc8/13_pods_pending.png)
+
+![Nouveaux nœuds DEV1-M provisionnés — kubectl get nodes montre 5 nœuds Ready](../../Image/TP4/Bloc8/14_nodes_scaleup.png)
+
+![Console Scaleway — nouveaux nœuds visibles dans le pool pool-paris-1](../../Image/TP4/Bloc8/15_console_autoscaler.png)
+
+### Étape 8.4 — Scale-down
+
+```bash
+kubectl delete -f 80-greedy.yaml
+```
+
+L'autoscaler attend ~10 min de sous-utilisation avant de supprimer les nœuds excédentaires, retournant à `min-size=2`.
+
+> **Point de vigilance** : oublier de supprimer le Deployment `greedy` maintiendrait le cluster à 5 nœuds et ferait dériver la facture. Toujours nettoyer les workloads de test.
+
+✅ **Checkpoint 8** : Scale-up de 2 à 5 nœuds observé en moins de 3 minutes. Nouveaux nœuds DEV1-M visibles dans la console Scaleway. Pods `Pending` schedulés automatiquement.
+
+---
+
+## Bloc 9 — Multi-AZ vs multi-région (théorique)
+
+### Objectif
+Comprendre les limites d'une architecture multi-AZ et les approches pour étendre vers le multi-région.
+
+### Limite : Kapsule est mono-région
+
+Notre cluster `tp4-cluster-dauvel` est multi-AZ (`fr-par-1` + `fr-par-2`). Il résiste à la panne d'une AZ Paris. Mais si **toute la région `fr-par` tombe**, le cluster entier est indisponible. Un cluster Kapsule ne peut pas avoir de nœuds dans plusieurs régions.
+
+### Options pour le multi-région
+
+1. **Deux clusters Kapsule indépendants**, un par région — avec Argo CD multi-cluster pour synchroniser les déploiements
+2. **Scaleway Kosmos** — offre cousine permettant un control plane unique acceptant des nœuds de plusieurs régions et même d'autres cloud providers (AWS, GCP, on-premise)
+
+### Ce que multi-AZ couvre et ne couvre pas
+
+**Protège contre :**
+- Panne d'un datacenter Scaleway Paris (fr-par-1 ou fr-par-2 isolément)
+- Maintenance planifiée d'une AZ (pods replanifiés dans l'autre AZ)
+- Panne d'un nœud individuel (autohealing + rescheduling)
+
+**Ne protège pas contre :**
+- Panne de toute la région `fr-par` (catastrophe naturelle, panne réseau régionale)
+- Corruption des données Postgres (le Block Storage est lié à une AZ — un volume `fr-par-2` ne peut pas être monté depuis `fr-par-1`)
+- Erreur humaine (suppression accidentelle du cluster ou des données)
+
+✅ **Checkpoint 9** : Compréhension claire de ce que multi-AZ couvre, et de ce qu'il ne couvre pas. Limites de Kapsule mono-région identifiées, alternatives documentées.
+
+---
+
+## Bloc 10 — Questionnaire de comparaison
+
+> Le questionnaire complet est disponible dans `tp4/comparaison.md`. Les points saillants sont reproduits ci-dessous.
+
+### A. Bootstrap et administration
+
+**Q1 — Nombre de commandes pour un cluster prêt**
+
+k3s nécessitait 5-6 commandes (installation server, récupération token, jonction agents, configuration kubeconfig) sans compter la correction manuelle de l'IP et l'installation des composants supplémentaires. Kapsule se réduit à **2 commandes** : `scw k8s cluster create` + `scw k8s kubeconfig install`. CNI, metrics-server, StorageClasses et autohealing sont livrés préconfigurés.
+
+**Q2 — Localisation du control plane**
+
+k3s : `kube-apiserver`, `etcd`, `kube-scheduler`, `kube-controller-manager` tournent sur `GODON-k3s-server`, visibles via `kubectl get pods -A`. Kapsule : la commande `kubectl get pods -A | grep -E "apiserver|etcd|scheduler"` ne retourne aucun résultat — le control plane est géré par Scaleway sur une infrastructure dédiée.
+
+**Q3 — Impact d'une panne du control plane**
+
+k3s : `sudo systemctl stop k3s` rend l'API inaccessible, aucun scheduling possible, intervention SSH manuelle requise. Kapsule : Scaleway garantit la disponibilité du control plane via son SLA — l'utilisateur ne le saurait probablement pas.
+
+### B. Networking et exposition
+
+**Q4 — IngressController et ressources créées**
+
+k3s : Traefik pré-installé avec un ServiceLB (klipper-lb, NodePort déguisé). Kapsule : `helm install ingress-nginx` a créé dans le cluster un Deployment, Service LoadBalancer, RBAC, ConfigMaps, IngressClass `nginx` — et **hors du cluster** un vrai Load Balancer Scaleway avec l'IP publique `51.158.58.244`.
+
+**Q5 — Pourquoi Let's Encrypt valide sur Kapsule mais pas k3s**
+
+Let's Encrypt impose une validation HTTP-01 sur le port 80 standard depuis Internet. Sur k3s, le port 80 était accessible via NodePort 30832 (non standard) sans IP publique stable ni DNS valide. Sur Kapsule, le vrai LB avec IP publique + DNS `tp4.dauvel.mediaschool-rouen.fr` permet la validation standard — certificat obtenu en 26 secondes.
+
+### C. Stockage
+
+**Q6 — PVC local-path vs scw-bssd quand un nœud tombe**
+
+`local-path` : données perdues si le nœud hébergeant le volume disparaît (stockage local `/var/lib/rancher/k3s/storage/`). `scw-bssd` : volume réseau distant que Scaleway détache et rattache au nouveau nœud — données préservées. Démontré : après `kubectl delete pod postgres-0 --force`, le pod a redémarré en 4 secondes avec ses données intactes.
+
+**Q7 — Coût du stockage**
+
+`scw-bssd` : ~0,10 €/Go/mois (5 Go → ~0,50 €/mois). `local-path` : 0 € supplémentaire — disque local de la VM déjà payée, mais sans garantie de survie des données.
+
+### D. Lifecycle et autoscaling
+
+**Q8 — Ajouter un nœud : k3s vs Kapsule**
+
+k3s : provisionner une VM, SSH, exécuter le script d'installation avec le token — ~5-10 min, manuel et peu reproductible. Kapsule : `scw k8s pool update <pool-id> size=4 region=fr-par` — une commande, ~2-3 min, entièrement scriptable.
+
+**Q9 — Autoscaling observé au Bloc 8**
+
+Scale-up déclenché en moins de 30 secondes après apparition des pods `Pending`. 3 nœuds DEV1-M provisionnés automatiquement. Sur k3s : le HPA scale les pods mais pas les nœuds — construire un Cluster Autoscaler sur k3s nécessiterait d'intégrer l'API Scaleway manuellement, pas réaliste sans effort significatif.
+
+**Q10 — Mise à jour Kubernetes 1.32 → 1.33**
+
+k3s : `curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=v1.33.x sh -` sur chaque nœud manuellement, avec drain et vérification de compatibilité des APIs. Kapsule : `scw k8s cluster upgrade $CLUSTER_ID version=1.33.x region=fr-par` — Scaleway gère le rolling upgrade du control plane puis des nœuds. Précautions communes : vérifier les APIs dépréciées, tester en staging, planifier hors heures de pointe.
+
+### E. Sécurité et coût
+
+**Q11 — Récupération du kubeconfig et révocation**
+
+k3s : `sudo cat /etc/rancher/k3s/k3s.yaml` — certificat client admin. Révocation complexe (recréer les certificats ou modifier RBAC manuellement). Kapsule : `scw k8s kubeconfig install $CLUSTER_ID` — basé sur les clés API Scaleway IAM. Révocation immédiate en supprimant la clé API dans la console IAM.
+
+**Q12 — Estimation du coût mensuel**
+
+| Ressource | Détail | Coût estimé/mois |
+|---|---|---|
+| 3 × DEV1-M (base) | 0,0198 €/h × 3 × 730h | ~43 € |
+| 1 Load Balancer S | ~0,012 €/h × 730h | ~9 € |
+| 5 Go Block Storage (scw-bssd) | ~0,10 €/Go × 5 | ~0,50 € |
+| Container Registry | Gratuit jusqu'à 75 Go | 0 € |
+| **Total estimé** | | **~57 €/mois** |
+
+À comparer : notre cluster k3s TP1 avec 3 × BASIC3-X2C-8G coûtait ~25 €/mois, mais sans LB, stockage managé ni autohealing.
+
+**Q13 — Incident à 3h du matin**
+
+k3s : l'utilisateur doit intervenir manuellement (SSH, diagnostic, redémarrage). Sans monitoring, l'incident peut passer inaperçu pendant des heures. Pas de SLA. Kapsule : control plane KO → Scaleway intervient (SLA). Nœud worker KO → autohealing recrée automatiquement le nœud. L'utilisateur reste responsable de ses workloads, mais est déchargé de toute l'infrastructure sous-jacente.
+
+### F. Géographie et résilience
+
+**Q14 — Ce que multi-AZ couvre et ne couvre pas**
+
+Protège contre la panne d'une AZ, la maintenance planifiée, la panne d'un nœud. Ne protège pas contre la panne de toute la région, une erreur humaine, la corruption des données (le Block Storage est lié à une AZ).
+
+**Q15 — Mono-région suffit-il ?**
+
+- App B2B française : mono-région (multi-AZ) **suffit** — utilisateurs locaux, RGPD natif.
+- App SaaS européenne (Berlin + Madrid + Stockholm) : mono-région **ne suffit pas** — latence trop élevée et risque régional.
+- Service soumis à HDS : mono-région **ne suffit pas** — HDS impose réplication géographique, PRA documenté, sites certifiés.
+
+### Synthèse libre
+
+**Q16 — Startup 3 devs, zéro SRE : k3s ou Kapsule ?**
+
+**Kapsule, sans hésiter.** Avec 3 développeurs et zéro SRE, personne n'a le temps de gérer les mises à jour Kubernetes nœud par nœud, surveiller la santé d'etcd, ou intervenir à 3h du matin si un nœud tombe. On l'a vu concrètement : k3s demande beaucoup d'interventions manuelles — clés SSH, problèmes de CNI, NetworkPolicies non supportées par Flannel, architecture hétérogène ARM64/amd64 causant des `ErrImagePull`... Kapsule absorbe toute cette complexité. Le surcoût (~30 €/mois) est largement justifié par le temps économisé et la fiabilité gagnée. La seule raison de choisir k3s serait un besoin de contrôle total (air-gap, conformité spécifique, contrainte budgétaire extrême) ou un contexte edge/IoT.
+
+---
+
+## Bloc 11 — Destruction des ressources (OBLIGATOIRE)
+
+### Objectif
+Supprimer proprement toutes les ressources Scaleway créées pendant le TP pour éviter toute facturation continue.
+
+### Étape 11.1 — Supprimer le Service LoadBalancer
+
+```bash
+kubectl delete svc -n ingress-nginx ingress-nginx-controller
+sleep 30   # laisser le CCM nettoyer le LB côté Scaleway
+```
+
+### Étape 11.2 — Supprimer les namespaces
+
+```bash
+kubectl delete namespace guestbook
+kubectl delete namespace ingress-nginx
+kubectl delete namespace cert-manager
+sleep 30
+```
+
+### Étape 11.3 — Vérifier les ressources externes
+
+```bash
+scw lb lb list region=fr-par
+scw block volume list zone=fr-par-1
+scw block volume list zone=fr-par-2
+```
+
+### Étape 11.4 — Supprimer le cluster
+
+```bash
+scw k8s cluster delete $CLUSTER_ID region=fr-par with-additional-resources=true
+```
+
+### Étape 11.5 — Supprimer le Container Registry
+
+```bash
+scw registry namespace list region=fr-par
+scw registry namespace delete <namespace-id> region=fr-par
+```
+
+### Étape 11.6 — Vérification finale
+
+```bash
+scw k8s cluster list region=fr-par
+scw lb lb list region=fr-par
+scw block volume list zone=fr-par-1
+scw block volume list zone=fr-par-2
+scw instance ip list zone=fr-par-1
+scw registry namespace list region=fr-par
+```
+
+Toutes ces listes doivent être vides.
+
+![scw k8s cluster list — liste vide, aucun cluster actif](../../Image/TP4/Bloc11/16_cluster_list_vide.png)
+
+![scw lb lb list — aucun Load Balancer actif](../../Image/TP4/Bloc11/17_lb_list_vide.png)
+
+![scw block volume list — aucun Block Storage actif](../../Image/TP4/Bloc11/18_volume_list_vide.png)
+
+![scw registry namespace list — aucun Container Registry actif](../../Image/TP4/Bloc11/19_registry_vide.png)
+
+![Console Scaleway — projet tp4-k8s-dauvel vide, aucune ressource active](../../Image/TP4/Bloc11/20_console_projet_vide.png)
+
+> **Pièges observés** : supprimer le Service LoadBalancer **avant** le cluster est essentiel. Sans cette étape, le Load Balancer Scaleway devient orphelin et continue d'être facturé même après suppression du cluster.
+
+✅ **Checkpoint 11** : Toutes les listes vides confirmées. Aucune ressource active dans le projet Scaleway.
+
+---
+
+## Synthèse des commandes TP4
+
+| Commande | Description |
+|---|---|
+| `scw init` | Configurer la CLI Scaleway |
+| `scw info` | Vérifier l'organisation et le projet actifs |
+| `scw k8s cluster create ...` | Créer un cluster Kapsule |
+| `scw k8s cluster wait $ID region=fr-par` | Attendre que le cluster soit prêt |
+| `scw k8s kubeconfig install $ID region=fr-par` | Télécharger le kubeconfig |
+| `scw k8s pool list cluster-id=$ID region=fr-par` | Lister les pools de nœuds |
+| `scw k8s pool update $POOL_ID autoscaling=true min-size=2 max-size=5` | Activer l'autoscaling |
+| `scw registry namespace create name=... region=fr-par` | Créer un namespace SCR |
+| `docker login rg.fr-par.scw.cloud -u nologin --password-stdin` | Authentification SCR |
+| `kubectl get certificate -n guestbook -w` | Suivre l'émission d'un certificat cert-manager |
+| `kubectl describe challenge` | Diagnostiquer un blocage Let's Encrypt |
+| `kubectl scale deploy/greedy --replicas=10` | Déclencher le scale-up du Cluster Autoscaler |
+| `scw k8s cluster delete $ID with-additional-resources=true` | Supprimer le cluster et ses ressources |
+| `scw lb lb list region=fr-par` | Vérifier qu'aucun LB n'est orphelin |
+| `scw block volume list zone=fr-par-1` | Vérifier qu'aucun volume n'est orphelin |
+
+---
+
+## Pièges rencontrés — TP4
+
+| Symptôme | Cause | Résolution |
+|---|---|---|
+| PVC en `Pending` prolongé | Provisionnement Block Storage lent (30s-2min) | Patienter, `kubectl describe pvc` pour confirmer |
+| `ImagePullBackOff` | `imagePullSecrets` oublié dans le Deployment ou Secret dans le mauvais namespace | Vérifier `kubectl describe pod`, recréer le secret dans `guestbook` |
+| `EXTERNAL-IP` reste `<pending>` | CCM en cours de provisionnement du LB | Attendre 1-2 min, `kubectl logs -n kube-system -l app=scaleway-cloud-controller-manager` |
+| Certificate stuck en `Issuing` | DNS non propagé ou Let's Encrypt ne peut pas atteindre le cluster | `kubectl describe challenge`, tester avec l'environnement `staging` d'abord |
+| Autoscaler ne déclenche pas | `requests.cpu` trop basse, pods schedulables sur les nœuds existants | Augmenter `requests.cpu` à `1500m`, vérifier `kubectl describe pod` |
+| LB orphelin facturé après destruction | Service LoadBalancer non supprimé avant `cluster delete` | Toujours supprimer le Service LB et attendre 30s avant de supprimer le cluster |
+| Volume Block Storage orphelin | PVC non supprimé avant `cluster delete` | `kubectl delete pvc`, puis `scw block volume delete` si nécessaire |

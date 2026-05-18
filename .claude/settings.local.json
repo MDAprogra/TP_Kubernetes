@@ -9,7 +9,9 @@
       "Bash(git add *)",
       "Bash(git pull *)",
       "Bash(git commit -m ' *)",
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\Corentin Godon\\\\Desktop\\\\MediaSchool\\\\Mastere1\\\\Cours\\\\Cours\\\\Arthur Baradel\\\\Kubernetes\\\\TP_Kubernetes\\\\Image\\\\TP4\" -Recurse -File)",
+      "Bash(Select-Object -ExpandProperty FullName)"
     ]
   }
 }
