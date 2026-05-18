@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: guestbook
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: webapp
+      tier: back
+  template:
+    metadata:
+      labels:
+        app: webapp
+        tier: back
+    spec:
+      imagePullSecrets:
+      - name: scw-registry-credentials
+      containers:
+      - name: backend
+        image: rg.fr-par.scw.cloud/tp4-dauvel/webapp-backend:v3.0
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 5000
+        envFrom:
+        - configMapRef:
+            name: webapp-config
+        env:
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: POSTGRES_USER
+        - name: DB_PASS
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: POSTGRES_PASSWORD
+        - name: DB_NAME
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: POSTGRES_DB
+        - name: DATABASE_URL
+          value: "postgresql://$(DB_USER):$(DB_PASS)@postgres-0.postgres-svc.guestbook.svc.cluster.local:5432/$(DB_NAME)"
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 5000
+          initialDelaySeconds: 10
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-svc
+  namespace: guestbook
+  labels:
+    app: webapp
+    tier: back
+spec:
+  selector:
+    app: webapp
+    tier: back
+  ports:
+  - port: 5000
+    targetPort: 5000
+    name: http
